@@ -4,7 +4,6 @@ A minimal relational database written in Go, featuring MVCC transactions, WAL re
 
 [![Go Version](https://img.shields.io/badge/Go-1.20+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Test Coverage](https://img.shields.io/badge/coverage-73.2%25-brightgreen)](https://github.com/sausheong/mindb)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ##  Features
 
@@ -347,9 +346,6 @@ Contributions are welcome! Areas for improvement:
 - [ ] More index types (Hash, GiST)
 - [ ] Parallel query execution
 
-##  License
-
-MIT License - see LICENSE file for details
 
 ##  Acknowledgments
 
