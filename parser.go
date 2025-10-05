@@ -1,4 +1,4 @@
-package main
+package mindb
 
 import (
 	"fmt"
@@ -11,6 +11,7 @@ type StatementType int
 
 const (
 	CreateDatabase StatementType = iota
+	DropDatabase
 	CreateTable
 	AlterTable
 	DropTable
@@ -149,6 +150,8 @@ func (p *Parser) Parse(sql string) (*Statement, error) {
 		return &Statement{Type: RollbackTransaction}, nil
 	case strings.HasPrefix(sqlUpper, "CREATE DATABASE"):
 		return p.parseCreateDatabase(sql)
+	case strings.HasPrefix(sqlUpper, "DROP DATABASE"):
+		return p.parseDropDatabase(sql)
 	case strings.HasPrefix(sqlUpper, "CREATE TABLE"):
 		return p.parseCreateTable(sql)
 	case strings.HasPrefix(sqlUpper, "ALTER TABLE"):
@@ -183,6 +186,24 @@ func (p *Parser) parseCreateDatabase(sql string) (*Statement, error) {
 		Type:        CreateDatabase,
 		Database:    matches[1],
 		IfNotExists: ifNotExists,
+	}, nil
+}
+
+// parseDropDatabase parses DROP DATABASE statement
+func (p *Parser) parseDropDatabase(sql string) (*Statement, error) {
+	// Support IF EXISTS
+	re := regexp.MustCompile(`(?i)DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+	matches := re.FindStringSubmatch(sql)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DROP DATABASE syntax")
+	}
+
+	ifExists := strings.Contains(strings.ToUpper(sql), "IF EXISTS")
+
+	return &Statement{
+		Type:     DropDatabase,
+		Database: matches[1],
+		IfExists: ifExists,
 	}, nil
 }
 
@@ -431,10 +452,41 @@ func (p *Parser) parseInsert(sql string) (*Statement, error) {
 		columns = append(columns, Column{Name: strings.TrimSpace(col)})
 	}
 
-	// Parse values
-	values, err := p.parseValues(valuesStr)
-	if err != nil {
-		return nil, err
+	// Parse values - support multiple value sets for batch insert
+	// VALUES (1,'a'), (2,'b'), (3,'c')
+	allValues := make([][]interface{}, 0)
+	
+	// Check if there are multiple value sets
+	remainingAfterFirst := strings.TrimSpace(remainingSQL[valuesEnd+1:])
+	if strings.HasPrefix(remainingAfterFirst, ",") {
+		// Multiple value sets - parse them all
+		fullValuesStr := remainingSQL[:valuesEnd+1]
+		valueSets := p.splitValueSets(fullValuesStr)
+		
+		for _, valueSet := range valueSets {
+			values, err := p.parseValues(valueSet)
+			if err != nil {
+				return nil, err
+			}
+			allValues = append(allValues, values)
+		}
+		
+		// Update afterValues for RETURNING clause
+		// Find where the value sets end
+		lastParen := strings.LastIndex(remainingSQL, ")")
+		if lastParen > valuesEnd {
+			afterValues = strings.TrimSpace(remainingSQL[lastParen+1:])
+			if strings.HasPrefix(strings.ToUpper(afterValues), "RETURNING") {
+				returningStr = strings.TrimSpace(afterValues[9:])
+			}
+		}
+	} else {
+		// Single value set
+		values, err := p.parseValues(valuesStr)
+		if err != nil {
+			return nil, err
+		}
+		allValues = append(allValues, values)
 	}
 
 	// Parse RETURNING clause
@@ -451,9 +503,53 @@ func (p *Parser) parseInsert(sql string) (*Statement, error) {
 		Schema:    schema,
 		Table:     tableName,
 		Columns:   columns,
-		Values:    [][]interface{}{values},
+		Values:    allValues,
 		Returning: returning,
 	}, nil
+}
+
+// splitValueSets splits multiple value sets like "(1,'a'), (2,'b'), (3,'c')"
+func (p *Parser) splitValueSets(valuesStr string) []string {
+	result := make([]string, 0)
+	var current strings.Builder
+	parenDepth := 0
+	inQuote := false
+	var quoteChar rune
+	
+	for _, ch := range valuesStr {
+		if !inQuote {
+			if ch == '\'' || ch == '"' {
+				inQuote = true
+				quoteChar = ch
+			} else if ch == '(' {
+				parenDepth++
+			} else if ch == ')' {
+				parenDepth--
+				current.WriteRune(ch)
+				if parenDepth == 0 {
+					// End of a value set
+					valueSet := strings.TrimSpace(current.String())
+					if len(valueSet) > 2 { // Must have at least "()"
+						// Remove outer parentheses
+						valueSet = strings.TrimSpace(valueSet[1 : len(valueSet)-1])
+						result = append(result, valueSet)
+					}
+					current.Reset()
+					continue
+				}
+			} else if ch == ',' && parenDepth == 0 {
+				// Skip commas between value sets
+				continue
+			}
+		} else {
+			if ch == quoteChar {
+				inQuote = false
+			}
+		}
+		current.WriteRune(ch)
+	}
+	
+	return result
 }
 
 // parseUpdate parses UPDATE statement

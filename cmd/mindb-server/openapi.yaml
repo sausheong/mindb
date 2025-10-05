@@ -1,0 +1,494 @@
+openapi: 3.0.3
+info:
+  title: Mindb HTTP API
+  description: Production-grade HTTP API for Mindb - a minimal relational database
+  version: 1.0.0
+  contact:
+    name: Chang Sau Sheong
+    url: https://github.com/sausheong/mindb
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
+paths:
+  /query:
+    post:
+      summary: Execute read-only SQL query
+      description: Execute a SELECT query with auto-commit
+      operationId: query
+      tags:
+        - Queries
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              simple:
+                summary: Simple SELECT
+                value:
+                  sql: "SELECT id, name FROM users WHERE id = $1"
+                  args: [42]
+                  limit: 1000
+                  timeout_ms: 2000
+      responses:
+        '200':
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /execute:
+    post:
+      summary: Execute DML/DDL statement
+      description: Execute INSERT, UPDATE, DELETE, CREATE, etc. with auto-commit
+      operationId: execute
+      tags:
+        - Execution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteRequest'
+            examples:
+              insert:
+                summary: INSERT with RETURNING
+                value:
+                  sql: "INSERT INTO users(id, name) VALUES($1, $2) RETURNING id"
+                  args: [1, "Alice"]
+              update:
+                summary: UPDATE statement
+                value:
+                  sql: "UPDATE users SET name = $1 WHERE id = $2"
+                  args: ["Bob", 1]
+      responses:
+        '200':
+          description: Statement executed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /tx/begin:
+    post:
+      summary: Begin a new transaction
+      description: Start a new transaction with snapshot isolation
+      operationId: txBegin
+      tags:
+        - Transactions
+      responses:
+        '200':
+          description: Transaction started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TxBeginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Too many transactions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /tx/{txID}/exec:
+    post:
+      summary: Execute statement in transaction
+      description: Execute a statement within an existing transaction
+      operationId: txExec
+      tags:
+        - Transactions
+      parameters:
+        - name: txID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Transaction ID from /tx/begin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteRequest'
+      responses:
+        '200':
+          description: Statement executed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Transaction not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /tx/{txID}/commit:
+    post:
+      summary: Commit transaction
+      description: Commit an open transaction
+      operationId: txCommit
+      tags:
+        - Transactions
+      parameters:
+        - name: txID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transaction committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TxStatusResponse'
+        '404':
+          description: Transaction not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /tx/{txID}/rollback:
+    post:
+      summary: Rollback transaction
+      description: Rollback an open transaction
+      operationId: txRollback
+      tags:
+        - Transactions
+      parameters:
+        - name: txID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transaction rolled back
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TxStatusResponse'
+        '404':
+          description: Transaction not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /stream:
+    get:
+      summary: Stream query results as NDJSON
+      description: Execute a query and stream results as newline-delimited JSON
+      operationId: stream
+      tags:
+        - Queries
+      parameters:
+        - name: sql
+          in: query
+          required: true
+          schema:
+            type: string
+          description: SQL query to execute
+        - name: args
+          in: query
+          required: false
+          schema:
+            type: string
+          description: JSON-encoded array of query arguments
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Maximum number of rows to return
+      responses:
+        '200':
+          description: Streaming results
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Newline-delimited JSON objects
+              example: |
+                {"id":1,"name":"Alice"}
+                {"id":2,"name":"Bob"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          $ref: '#/components/responses/Timeout'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /health:
+    get:
+      summary: Health check
+      description: Check server health and get statistics
+      operationId: health
+      tags:
+        - System
+      security: []
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  uptime_seconds:
+                    type: integer
+                    example: 3600
+                  open_transactions:
+                    type: integer
+                    example: 5
+                  available_exec_slots:
+                    type: integer
+                    example: 28
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    BearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    QueryRequest:
+      type: object
+      required:
+        - sql
+      properties:
+        sql:
+          type: string
+          description: SQL query to execute
+          example: "SELECT id, name FROM users WHERE id = $1"
+        args:
+          type: array
+          items: {}
+          description: Query arguments for parameterized queries
+          example: [42]
+        limit:
+          type: integer
+          description: Maximum number of rows to return
+          example: 1000
+        timeout_ms:
+          type: integer
+          description: Query timeout in milliseconds
+          example: 2000
+
+    QueryResponse:
+      type: object
+      properties:
+        columns:
+          type: array
+          items:
+            type: string
+          description: Column names
+          example: ["id", "name"]
+        rows:
+          type: array
+          items:
+            type: array
+            items: {}
+          description: Result rows
+          example: [[42, "Alice"]]
+        row_count:
+          type: integer
+          description: Number of rows returned
+          example: 1
+        truncated:
+          type: boolean
+          description: Whether results were truncated by limit
+          example: false
+        latency_ms:
+          type: integer
+          format: int64
+          description: Query execution time in milliseconds
+          example: 3
+
+    ExecuteRequest:
+      type: object
+      required:
+        - sql
+      properties:
+        sql:
+          type: string
+          description: SQL statement to execute
+          example: "INSERT INTO users(id, name) VALUES($1, $2)"
+        args:
+          type: array
+          items: {}
+          description: Statement arguments
+          example: [1, "Alice"]
+        timeout_ms:
+          type: integer
+          description: Execution timeout in milliseconds
+          example: 2000
+
+    ExecuteResponse:
+      type: object
+      properties:
+        affected_rows:
+          type: integer
+          description: Number of rows affected
+          example: 1
+        returning:
+          $ref: '#/components/schemas/QueryResponse'
+          description: RETURNING clause results (if applicable)
+        latency_ms:
+          type: integer
+          format: int64
+          description: Execution time in milliseconds
+          example: 5
+
+    TxBeginResponse:
+      type: object
+      properties:
+        tx:
+          type: string
+          description: Transaction ID
+          example: "abc123def456..."
+        isolation:
+          type: string
+          description: Isolation level
+          example: "snapshot"
+
+    TxStatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [committed, rolled_back]
+          description: Transaction status
+          example: "committed"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+
+    ErrorDetail:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - BAD_REQUEST
+            - TIMEOUT
+            - CONFLICT
+            - NOT_FOUND
+            - INTERNAL_ERROR
+            - UNAUTHORIZED
+            - TOO_MANY_TRANSACTIONS
+            - INVALID_SQL
+          description: Error code
+          example: "TIMEOUT"
+        message:
+          type: string
+          description: Human-readable error message
+          example: "query execution timeout"
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "BAD_REQUEST"
+              message: "invalid JSON"
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "UNAUTHORIZED"
+              message: "invalid or missing API key"
+
+    Timeout:
+      description: Request timeout
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "TIMEOUT"
+              message: "statement execution timeout"
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: "INTERNAL_ERROR"
+              message: "internal server error"
+
+tags:
+  - name: Queries
+    description: Read-only query operations
+  - name: Execution
+    description: DML/DDL execution operations
+  - name: Transactions
+    description: Explicit transaction management
+  - name: System
+    description: System and health endpoints

@@ -1,4 +1,4 @@
-package main
+package mindb
 
 import (
 	"encoding/binary"
@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // PagedTable represents a table using paged heap file storage
@@ -36,6 +37,7 @@ type PagedEngine struct {
 	vacuumManager  *VacuumManager
 	catalog        *SystemCatalog
 	currentTxn     *Transaction // Current transaction (if any)
+	queryCache     *QueryCache  // Query result cache
 	mu             sync.RWMutex
 }
 
@@ -58,6 +60,7 @@ func NewPagedEngineWithWAL(dataDir string, enableWAL bool) (*PagedEngine, error)
 		txnManager:    txnManager,
 		vacuumManager: NewVacuumManager(txnManager),
 		catalog:       catalog,
+		queryCache:    NewQueryCache(60*time.Second, 1000), // 60s TTL, 1000 entries
 	}
 	
 	// Load transaction state
@@ -190,6 +193,42 @@ func (e *PagedEngine) CreateDatabase(name string) error {
 	return nil
 }
 
+// DropDatabase drops a database
+func (e *PagedEngine) DropDatabase(name string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
+	if _, exists := e.databases[name]; !exists {
+		return fmt.Errorf("database '%s' does not exist", name)
+	}
+	
+	// Remove from catalog
+	if err := e.catalog.DropDatabase(name); err != nil {
+		return err
+	}
+	
+	// Remove from memory
+	delete(e.databases, name)
+	
+	// If this was the current database, clear it
+	if e.currentDB == name {
+		e.currentDB = ""
+	}
+	
+	// Remove physical database directory
+	dbPath := filepath.Join(e.dataDir, name)
+	if err := os.RemoveAll(dbPath); err != nil {
+		return fmt.Errorf("failed to remove database directory: %v", err)
+	}
+	
+	// Save catalog
+	if err := e.catalog.SaveCatalog(); err != nil {
+		return fmt.Errorf("failed to save catalog: %v", err)
+	}
+	
+	return nil
+}
+
 // UseDatabase switches to a database
 func (e *PagedEngine) UseDatabase(name string) error {
 	e.mu.RLock()
@@ -313,6 +352,11 @@ func (e *PagedEngine) DropTable(tableName string) error {
 
 // InsertRow inserts a row into a table
 func (e *PagedEngine) InsertRow(tableName string, row Row) error {
+	// Invalidate query cache for this table (Phase 3 optimization)
+	if e.queryCache != nil {
+		e.queryCache.Invalidate(tableName)
+	}
+	
 	db, err := e.getCurrentDatabase()
 	if err != nil {
 		return err
@@ -471,6 +515,13 @@ func (e *PagedEngine) ExecuteQuery(stmt *Statement) ([]Row, error) {
 
 // SelectRows selects rows from a table
 func (e *PagedEngine) SelectRows(tableName string, conditions []Condition) ([]Row, error) {
+	// Check query cache first (Phase 3 optimization)
+	if e.queryCache != nil {
+		if cachedRows, found := e.queryCache.Get(tableName, conditions); found {
+			return cachedRows, nil // Cache hit!
+		}
+	}
+	
 	db, err := e.getCurrentDatabase()
 	if err != nil {
 		return nil, err
@@ -524,6 +575,11 @@ func (e *PagedEngine) SelectRows(tableName string, conditions []Condition) ([]Ro
 	
 	if err != nil {
 		return nil, fmt.Errorf("scan failed: %v", err)
+	}
+	
+	// Cache the results (Phase 3 optimization)
+	if e.queryCache != nil && len(results) > 0 {
+		e.queryCache.Put(tableName, conditions, results)
 	}
 	
 	return results, nil
@@ -597,6 +653,11 @@ func (e *PagedEngine) applyLimit(rows []Row, limit int, offset int) []Row {
 
 // UpdateRows updates rows in a table
 func (e *PagedEngine) UpdateRows(tableName string, updates map[string]interface{}, conditions []Condition) (int, error) {
+	// Invalidate query cache for this table (Phase 3 optimization)
+	if e.queryCache != nil {
+		e.queryCache.Invalidate(tableName)
+	}
+	
 	db, err := e.getCurrentDatabase()
 	if err != nil {
 		return 0, err
@@ -624,8 +685,13 @@ func (e *PagedEngine) UpdateRows(tableName string, updates map[string]interface{
 	
 	count := 0
 	
-	// Scan and update matching tuples
-	for _, tid := range table.TupleIDs {
+	// Use query planner to determine optimal execution strategy
+	planner := NewQueryPlanner()
+	plan := planner.PlanUpdate(table, conditions)
+	tupleIDsToCheck := planner.ExecutePlan(plan, table, conditions)
+	
+	// Process tuples (either from index or full scan)
+	for _, tid := range tupleIDsToCheck {
 		tupleData, err := table.HeapFile.GetTuple(tid)
 		if err != nil {
 			continue
@@ -641,7 +707,12 @@ func (e *PagedEngine) UpdateRows(tableName string, updates map[string]interface{
 			continue
 		}
 		
-		if matchesConditions(tuple.Data, conditions) {
+		// If using index seek, we already know it matches; otherwise check conditions
+		if plan.ScanType != IndexSeek && !matchesConditions(tuple.Data, conditions) {
+			continue
+		}
+		
+		if plan.ScanType == IndexSeek || matchesConditions(tuple.Data, conditions) {
 			// Apply updates
 			for col, val := range updates {
 				tuple.Data[col] = val
@@ -680,6 +751,11 @@ func (e *PagedEngine) UpdateRows(tableName string, updates map[string]interface{
 
 // DeleteRows deletes rows from a table
 func (e *PagedEngine) DeleteRows(tableName string, conditions []Condition) (int, error) {
+	// Invalidate query cache for this table (Phase 3 optimization)
+	if e.queryCache != nil {
+		e.queryCache.Invalidate(tableName)
+	}
+	
 	db, err := e.getCurrentDatabase()
 	if err != nil {
 		return 0, err
@@ -696,13 +772,30 @@ func (e *PagedEngine) DeleteRows(tableName string, conditions []Condition) (int,
 	table.mu.Lock()
 	defer table.mu.Unlock()
 	
-	// Get transaction ID
-	txnID := e.getNextTxnID()
+	// Get snapshot once for all visibility checks and get transaction ID
+	var snapshot *Snapshot
+	var txnID uint32
+	var tempTxn *Transaction
+	
+	if e.currentTxn != nil {
+		snapshot = e.currentTxn.Snapshot
+		txnID = e.currentTxn.ID
+	} else {
+		// Create transaction once for both snapshot and txnID
+		tempTxn, _ = e.txnManager.BeginTransaction()
+		snapshot = tempTxn.Snapshot
+		txnID = tempTxn.ID
+	}
 	
 	count := 0
 	
-	// Scan and mark matching tuples as deleted (MVCC delete)
-	for _, tid := range table.TupleIDs {
+	// Use query planner to determine optimal execution strategy
+	planner := NewQueryPlanner()
+	plan := planner.PlanDelete(table, conditions)
+	tupleIDsToCheck := planner.ExecutePlan(plan, table, conditions)
+	
+	// Process tuples (either from index or full scan)
+	for _, tid := range tupleIDsToCheck {
 		tupleData, err := table.HeapFile.GetTuple(tid)
 		if err != nil {
 			continue
@@ -713,33 +806,33 @@ func (e *PagedEngine) DeleteRows(tableName string, conditions []Condition) (int,
 			continue
 		}
 		
-		// Check visibility
-		var snapshot *Snapshot
-		if e.currentTxn != nil {
-			snapshot = e.currentTxn.Snapshot
-		} else {
-			txn, _ := e.txnManager.BeginTransaction()
-			snapshot = txn.Snapshot
-		}
-		
+		// Check visibility using pre-created snapshot
 		if !e.txnManager.IsVisible(tuple, snapshot) {
 			continue
 		}
 		
-		if matchesConditions(tuple.Data, conditions) {
-			// MVCC delete: set Xmax instead of physical delete
-			newData, err := SerializeTupleWithHeader(tuple.Data, table.Columns, tuple.Header.Xmin, txnID)
-			if err != nil {
-				continue
-			}
-			
-			// Update tuple in place
-			if err := table.HeapFile.UpdateTuple(tid, newData); err != nil {
-				continue
-			}
-			
-			count++
+		// If using index seek, we already know it matches; otherwise check conditions
+		if plan.ScanType != IndexSeek && !matchesConditions(tuple.Data, conditions) {
+			continue
 		}
+		
+		// MVCC delete: set Xmax instead of physical delete
+		newData, err := SerializeTupleWithHeader(tuple.Data, table.Columns, tuple.Header.Xmin, txnID)
+		if err != nil {
+			continue
+		}
+		
+		// Update tuple in place
+		if err := table.HeapFile.UpdateTuple(tid, newData); err != nil {
+			continue
+		}
+		
+		count++
+	}
+	
+	// Auto-commit temporary transaction if we created one
+	if tempTxn != nil {
+		e.txnManager.CommitTransaction(tempTxn.ID)
 	}
 	
 	return count, nil

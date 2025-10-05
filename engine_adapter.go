@@ -1,4 +1,4 @@
-package main
+package mindb
 
 import (
 	"fmt"
@@ -33,6 +33,8 @@ func (ea *EngineAdapter) Execute(stmt *Statement) (string, error) {
 		return ea.rollbackTransaction()
 	case CreateDatabase:
 		return ea.createDatabase(stmt)
+	case DropDatabase:
+		return ea.dropDatabase(stmt)
 	case CreateTable:
 		return ea.createTable(stmt)
 	case AlterTable:
@@ -68,6 +70,14 @@ func (ea *EngineAdapter) createDatabase(stmt *Statement) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Database '%s' created successfully", stmt.Database), nil
+}
+
+// dropDatabase drops a database
+func (ea *EngineAdapter) dropDatabase(stmt *Statement) (string, error) {
+	if err := ea.pagedEngine.DropDatabase(stmt.Database); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Database '%s' dropped successfully", stmt.Database), nil
 }
 
 // createTable creates a new table
