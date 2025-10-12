@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/sausheong/mindb/cmd/mindb-server/internal/lockfile"
 	"github.com/sausheong/mindb/cmd/mindb-server/internal/middleware"
 	"github.com/sausheong/mindb/cmd/mindb-server/internal/semaphore"
+	"github.com/sausheong/mindb/cmd/mindb-server/internal/session"
 	"github.com/sausheong/mindb/cmd/mindb-server/internal/txmanager"
 )
 
@@ -85,6 +88,12 @@ func run() error {
 	// Create execution semaphore
 	execSem := semaphore.New(cfg.ExecConcurrency)
 
+	// Create session manager
+	sessionMgr := session.NewManager(cfg.SessionSigningKey, cfg.SessionTimeout)
+	
+	// Start session cleanup worker
+	go middleware.SessionCleanupWorker(sessionMgr, 5*time.Minute)
+
 	// Create handlers
 	handlers := api.NewHandlers(database, txMgr, execSem, logger, cfg.StmtTimeout)
 
@@ -96,11 +105,21 @@ func run() error {
 	r.Use(chimiddleware.RealIP)
 	r.Use(middleware.RecoveryMiddleware(logger))
 	r.Use(middleware.LoggingMiddleware(logger))
+	r.Use(middleware.SecurityHeadersMiddleware())
 	r.Use(chimiddleware.Compress(5))
+
+	// HTTPS redirect middleware (if TLS is enabled and redirect is configured)
+	if cfg.EnableTLS && cfg.TLSRedirectHTTP {
+		r.Use(middleware.HTTPSRedirectMiddleware(cfg.TLSRedirectPort))
+	}
 
 	// Auth middleware (if enabled)
 	if !cfg.AuthDisabled {
-		r.Use(middleware.AuthMiddleware(cfg.APIKey, cfg.AuthDisabled))
+		// Use session-based authentication with HTTP-only cookies
+		r.Use(middleware.SessionAuthMiddleware(database, sessionMgr, true))
+	} else {
+		// No auth - use root user
+		r.Use(middleware.SessionAuthMiddleware(database, sessionMgr, true))
 	}
 
 	// Routes
@@ -114,11 +133,21 @@ func run() error {
 	r.Post("/tx/{txID}/commit", handlers.TxCommitHandler())
 	r.Post("/tx/{txID}/rollback", handlers.TxRollbackHandler())
 	
+	// WASM Stored Procedure routes
+	r.Post("/procedures", handlers.CreateProcedureHandler())        // Create procedure
+	r.Delete("/procedures/{name}", handlers.DropProcedureHandler()) // Drop procedure
+	r.Get("/procedures", handlers.ListProceduresHandler())          // List procedures
+	r.Post("/procedures/{name}/call", handlers.CallProcedureHandler()) // Call procedure
+	
 	// Streaming
 	r.Get("/stream", handlers.StreamHandler())
 	
 	// Health check
 	r.Get("/health", handlers.HealthHandler())
+	
+	// Session management endpoints
+	r.Post("/auth/logout", middleware.LogoutHandler(sessionMgr))
+	r.Post("/auth/refresh", middleware.RefreshSessionHandler(sessionMgr))
 
 	// Metrics endpoint (if enabled)
 	if cfg.EnableMetrics {
@@ -126,31 +155,84 @@ func run() error {
 		// r.Get("/metrics", promhttp.Handler())
 	}
 
-	// Wrap handler with HTTP/2 support (h2c = HTTP/2 Cleartext)
-	h2s := &http2.Server{}
-	h2cHandler := h2c.NewHandler(r, h2s)
+	// Serve web console at /console
+	r.Get("/console", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "./web/index.html")
+	})
+	
+	// Serve static files for web console
+	r.Get("/console/*", func(w http.ResponseWriter, r *http.Request) {
+		// Remove /console prefix to get the actual file path
+		filePath := strings.TrimPrefix(r.URL.Path, "/console")
+		if filePath == "" || filePath == "/" {
+			http.ServeFile(w, r, "./web/index.html")
+			return
+		}
+		
+		// Serve static file from web directory
+		fullPath := "./web" + filePath
+		http.ServeFile(w, r, fullPath)
+	})
 	
 	// Create HTTP server with optimized settings
+	var handler http.Handler
+	if cfg.EnableTLS {
+		// Use native HTTP/2 with TLS
+		handler = r
+	} else {
+		// Use h2c (HTTP/2 without TLS) for development
+		handler = h2c.NewHandler(r, &http2.Server{})
+	}
+
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      h2cHandler, // HTTP/2 enabled
+		Handler:      handler,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,
-		// Enable HTTP/2 and connection pooling
-		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+
+	// Configure TLS if enabled
+	if cfg.EnableTLS {
+		tlsConfig := configureTLS(cfg)
+		srv.TLSConfig = tlsConfig
+		logger.Info().Msg("TLS 1.3 configured with secure cipher suites")
+	}
+
+	// Log server startup
+	if cfg.EnableTLS {
+		logger.Info().
+			Str("addr", cfg.HTTPAddr).
+			Str("cert", cfg.TLSCertFile).
+			Msg("server listening with TLS")
+	} else {
+		logger.Info().
+			Str("addr", cfg.HTTPAddr).
+			Msg("server listening (HTTP - consider enabling TLS for production)")
 	}
 	
 	// Configure transport for better connection pooling
 	srv.SetKeepAlivesEnabled(true)
-	
-	logger.Info().Msg("HTTP/2 enabled (h2c)")
+	if cfg.EnableTLS {
+		logger.Info().Msg("HTTP/2 enabled with TLS")
+	} else {
+		logger.Info().Msg("HTTP/2 enabled (h2c - consider enabling TLS for production)")
+	}
 
 	// Start server in goroutine
 	serverErrors := make(chan error, 1)
 	go func() {
-		logger.Info().Str("addr", cfg.HTTPAddr).Msg("http server listening")
-		serverErrors <- srv.ListenAndServe()
+		if cfg.EnableTLS {
+			// Start with TLS
+			if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+				serverErrors <- fmt.Errorf("TLS enabled but cert/key files not specified")
+				return
+			}
+			serverErrors <- srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		} else {
+			// Start without TLS
+			serverErrors <- srv.ListenAndServe()
+		}
 	}()
 
 	// Wait for interrupt signal or server error
@@ -200,4 +282,34 @@ func setupLogger(level string) zerolog.Logger {
 		Timestamp().
 		Caller().
 		Logger()
+}
+
+// configureTLS sets up TLS 1.3 with secure cipher suites and best practices
+func configureTLS(cfg *config.Config) *tls.Config {
+	return &tls.Config{
+		// Minimum TLS version: TLS 1.3 (most secure)
+		MinVersion: tls.VersionTLS13,
+		
+		// Prefer server cipher suites
+		PreferServerCipherSuites: true,
+		
+		// TLS 1.3 cipher suites (automatically used with TLS 1.3)
+		// TLS 1.3 has only secure cipher suites, no need to explicitly configure
+		
+		// Curve preferences for ECDHE
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,    // Most secure and fastest
+			tls.CurveP256, // NIST P-256
+			tls.CurveP384, // NIST P-384
+		},
+		
+		// Session tickets for resumption (TLS 1.3)
+		SessionTicketsDisabled: false,
+		
+		// Client authentication (optional, can be configured later)
+		ClientAuth: tls.NoClientCert,
+		
+		// Next protocols for HTTP/2
+		NextProtos: []string{"h2", "http/1.1"},
+	}
 }

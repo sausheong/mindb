@@ -99,3 +99,69 @@ type BatchQueryResponse struct {
 	Results   []BatchQueryResult `json:"results"`
 	TotalTime int64              `json:"total_time_ms"`
 }
+
+// CreateProcedureRequest represents a request to create a stored procedure
+type CreateProcedureRequest struct {
+	Name        string   `json:"name"`
+	Language    string   `json:"language"`    // "wasm", "rust", "go", etc.
+	WasmBase64  string   `json:"wasm_base64"` // Base64-encoded WASM bytecode
+	Params      []Param  `json:"params"`
+	ReturnType  string   `json:"return_type"`
+	Description string   `json:"description,omitempty"`
+}
+
+// Param represents a procedure parameter
+type Param struct {
+	Name     string `json:"name"`
+	DataType string `json:"data_type"`
+}
+
+// CreateProcedureResponse represents the response for creating a procedure
+type CreateProcedureResponse struct {
+	Name      string `json:"name"`
+	Message   string `json:"message"`
+	LatencyMS int64  `json:"latency_ms"`
+}
+
+// DropProcedureRequest represents a request to drop a stored procedure
+type DropProcedureRequest struct {
+	Name     string `json:"name"`
+	IfExists bool   `json:"if_exists,omitempty"`
+}
+
+// DropProcedureResponse represents the response for dropping a procedure
+type DropProcedureResponse struct {
+	Name      string `json:"name"`
+	Message   string `json:"message"`
+	LatencyMS int64  `json:"latency_ms"`
+}
+
+// ListProceduresResponse represents the response for listing procedures
+type ListProceduresResponse struct {
+	Procedures []ProcedureInfo `json:"procedures"`
+	Count      int             `json:"count"`
+	LatencyMS  int64           `json:"latency_ms"`
+}
+
+// ProcedureInfo represents procedure metadata
+type ProcedureInfo struct {
+	Name        string   `json:"name"`
+	Language    string   `json:"language"`
+	Params      []Param  `json:"params"`
+	ReturnType  string   `json:"return_type"`
+	Description string   `json:"description,omitempty"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+// CallProcedureRequest represents a request to call a stored procedure
+type CallProcedureRequest struct {
+	Name string        `json:"name"`
+	Args []interface{} `json:"args"`
+}
+
+// CallProcedureResponse represents the response for calling a procedure
+type CallProcedureResponse struct {
+	Result    interface{} `json:"result"`
+	LatencyMS int64       `json:"latency_ms"`
+}

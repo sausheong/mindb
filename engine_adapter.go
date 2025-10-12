@@ -24,6 +24,15 @@ func NewEngineAdapter(dataDir string, enableWAL bool) (*EngineAdapter, error) {
 
 // Execute executes a parsed statement (backward compatibility interface)
 func (ea *EngineAdapter) Execute(stmt *Statement) (string, error) {
+	// Check permissions (except for user management commands which have their own checks)
+	if stmt.Type != CreateUser && stmt.Type != DropUser && 
+	   stmt.Type != GrantPrivileges && stmt.Type != RevokePrivileges && 
+	   stmt.Type != ShowGrants {
+		if err := ea.checkPermission(stmt); err != nil {
+			return "", err
+		}
+	}
+	
 	switch stmt.Type {
 	case BeginTransaction:
 		return ea.beginTransaction()
@@ -49,6 +58,34 @@ func (ea *EngineAdapter) Execute(stmt *Statement) (string, error) {
 		return ea.updateData(stmt)
 	case Delete:
 		return ea.deleteData(stmt)
+	case DescribeTable:
+		return ea.describeTable(stmt)
+	case CallProcedure:
+		return ea.callProcedure(stmt)
+	case CreateUser:
+		return ea.createUser(stmt)
+	case DropUser:
+		return ea.dropUser(stmt)
+	case GrantPrivileges:
+		return ea.grantPrivileges(stmt)
+	case RevokePrivileges:
+		return ea.revokePrivileges(stmt)
+	case ShowGrants:
+		return ea.showGrants(stmt)
+	case ShowUsers:
+		return ea.showUsers(stmt)
+	case AlterUser:
+		return ea.alterUser(stmt)
+	case CreateRole:
+		return ea.createRole(stmt)
+	case DropRole:
+		return ea.dropRole(stmt)
+	case GrantRole:
+		return ea.grantRole(stmt)
+	case RevokeRole:
+		return ea.revokeRole(stmt)
+	case ShowRoles:
+		return ea.showRoles(stmt)
 	default:
 		return "", fmt.Errorf("unsupported statement type")
 	}
@@ -57,6 +94,11 @@ func (ea *EngineAdapter) Execute(stmt *Statement) (string, error) {
 // UseDatabase switches to a database
 func (ea *EngineAdapter) UseDatabase(name string) error {
 	return ea.pagedEngine.UseDatabase(name)
+}
+
+// GetWASMEngine returns the WASM engine for introspection
+func (ea *EngineAdapter) GetWASMEngine() *WASMEngine {
+	return ea.pagedEngine.GetWASMEngine()
 }
 
 // Close closes the engine
@@ -524,4 +566,455 @@ func (ea *EngineAdapter) rollbackTransaction() (string, error) {
 		return "", err
 	}
 	return "Transaction rolled back", nil
+}
+
+// CreateProcedureViaAdapter creates a stored procedure
+func (ea *EngineAdapter) CreateProcedureViaAdapter(proc *StoredProcedure) error {
+	return ea.pagedEngine.CreateProcedure(proc)
+}
+
+// DropProcedureViaAdapter drops a stored procedure
+func (ea *EngineAdapter) DropProcedureViaAdapter(name string) error {
+	return ea.pagedEngine.DropProcedure(name)
+}
+
+// ListProceduresViaAdapter lists all stored procedures
+func (ea *EngineAdapter) ListProceduresViaAdapter() []*StoredProcedure {
+	return ea.pagedEngine.ListProcedures()
+}
+
+// CallProcedureViaAdapter calls a stored procedure
+func (ea *EngineAdapter) CallProcedureViaAdapter(name string, args ...interface{}) (interface{}, error) {
+	return ea.pagedEngine.CallProcedure(name, args...)
+}
+
+// describeTable returns the schema of a table in table format
+func (ea *EngineAdapter) describeTable(stmt *Statement) (string, error) {
+	// Get current database
+	db, err := ea.pagedEngine.getCurrentDatabase()
+	if err != nil {
+		return "", err
+	}
+
+	// Get table metadata
+	db.mu.RLock()
+	table, exists := db.Tables[stmt.Table]
+	db.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("table '%s' does not exist", stmt.Table)
+	}
+
+	// Format table schema in the same format as SELECT results
+	// This allows parseResultString to parse it correctly
+	var result strings.Builder
+	
+	// Header separator
+	result.WriteString("+--------------------+---------------+----------+----------+----------+\n")
+	
+	// Column headers
+	result.WriteString("| Column             | Type          | Null     | Key      | Default  |\n")
+	
+	// Header separator
+	result.WriteString("+--------------------+---------------+----------+----------+----------+\n")
+
+	// Data rows
+	for _, col := range table.Columns {
+		nullStr := "YES"
+		if col.NotNull {
+			nullStr = "NO"
+		}
+		
+		keyStr := ""
+		if col.PrimaryKey {
+			keyStr = "PRI"
+		} else if col.Unique {
+			keyStr = "UNI"
+		}
+		
+		defaultStr := "NULL"
+		if col.Default != nil {
+			defaultStr = fmt.Sprintf("%v", col.Default)
+		}
+		
+		result.WriteString(fmt.Sprintf("| %-18s | %-13s | %-8s | %-8s | %-8s |\n", 
+			col.Name, col.DataType, nullStr, keyStr, defaultStr))
+	}
+
+	// Footer separator
+	result.WriteString("+--------------------+---------------+----------+----------+----------+\n")
+	
+	// Row count
+	result.WriteString(fmt.Sprintf("%d row(s) returned\n", len(table.Columns)))
+
+	return result.String(), nil
+}
+
+// callProcedure executes a stored procedure
+func (ea *EngineAdapter) callProcedure(stmt *Statement) (string, error) {
+	// Call the procedure
+	result, err := ea.pagedEngine.CallProcedure(stmt.ProcedureName, stmt.ProcedureArgs...)
+	if err != nil {
+		return "", fmt.Errorf("procedure call failed: %w", err)
+	}
+
+	// Format the result as a table for display
+	var output strings.Builder
+	
+	// Header
+	output.WriteString("+------------------+\n")
+	output.WriteString("| result           |\n")
+	output.WriteString("+------------------+\n")
+	
+	// Result value
+	output.WriteString(fmt.Sprintf("| %-16v |\n", result))
+	
+	// Footer
+	output.WriteString("+------------------+\n")
+	output.WriteString("1 row(s) returned\n")
+	
+	return output.String(), nil
+}
+
+// createUser creates a new user
+func (ea *EngineAdapter) createUser(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.CreateUser(stmt.Username, stmt.Password, stmt.Host)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		// Log error but don't fail the operation
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("User '%s'@'%s' created successfully", stmt.Username, stmt.Host), nil
+}
+
+// dropUser drops a user
+func (ea *EngineAdapter) dropUser(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.DropUser(stmt.Username, stmt.Host)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("User '%s'@'%s' dropped successfully", stmt.Username, stmt.Host), nil
+}
+
+// grantPrivileges grants privileges to a user
+func (ea *EngineAdapter) grantPrivileges(stmt *Statement) (string, error) {
+	// Convert string privileges to Privilege type
+	privileges := make([]Privilege, len(stmt.Privileges))
+	for i, p := range stmt.Privileges {
+		privileges[i] = Privilege(p)
+	}
+	
+	err := ea.pagedEngine.userManager.GrantPrivileges(
+		stmt.Username, stmt.Host, stmt.Database, stmt.Table, privileges)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Granted %v on %s.%s to '%s'@'%s'", 
+		stmt.Privileges, stmt.Database, stmt.Table, stmt.Username, stmt.Host), nil
+}
+
+// revokePrivileges revokes privileges from a user
+func (ea *EngineAdapter) revokePrivileges(stmt *Statement) (string, error) {
+	// Convert string privileges to Privilege type
+	privileges := make([]Privilege, len(stmt.Privileges))
+	for i, p := range stmt.Privileges {
+		privileges[i] = Privilege(p)
+	}
+	
+	err := ea.pagedEngine.userManager.RevokePrivileges(
+		stmt.Username, stmt.Host, stmt.Database, stmt.Table, privileges)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Revoked %v on %s.%s from '%s'@'%s'", 
+		stmt.Privileges, stmt.Database, stmt.Table, stmt.Username, stmt.Host), nil
+}
+
+// showGrants shows grants for a user
+func (ea *EngineAdapter) showGrants(stmt *Statement) (string, error) {
+	grants := ea.pagedEngine.userManager.ListGrants(stmt.Username, stmt.Host)
+	
+	if len(grants) == 0 {
+		return fmt.Sprintf("No grants for '%s'@'%s'", stmt.Username, stmt.Host), nil
+	}
+	
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf("Grants for '%s'@'%s':\n", stmt.Username, stmt.Host))
+	output.WriteString("+--------------------------------------------------+\n")
+	
+	for _, grant := range grants {
+		privs := make([]string, len(grant.Privileges))
+		for i, p := range grant.Privileges {
+			privs[i] = string(p)
+		}
+		
+		grantStr := fmt.Sprintf("GRANT %s ON %s.%s TO '%s'@'%s'",
+			strings.Join(privs, ", "),
+			grant.Database,
+			grant.Table,
+			grant.Username,
+			grant.Host)
+		
+		output.WriteString(fmt.Sprintf("| %-48s |\n", grantStr))
+	}
+	
+	output.WriteString("+--------------------------------------------------+\n")
+	return output.String(), nil
+}
+
+// showUsers shows all users in the system
+func (ea *EngineAdapter) showUsers(stmt *Statement) (string, error) {
+	users := ea.pagedEngine.userManager.ListUsers()
+	
+	if len(users) == 0 {
+		return "No users found", nil
+	}
+	
+	var output strings.Builder
+	output.WriteString("+----------------------+----------------------+---------------------+\n")
+	output.WriteString("| User                 | Host                 | Created             |\n")
+	output.WriteString("+----------------------+----------------------+---------------------+\n")
+	
+	for _, user := range users {
+		output.WriteString(fmt.Sprintf("| %-20s | %-20s | %-19s |\n",
+			truncate(user.Username, 20),
+			truncate(user.Host, 20),
+			user.CreatedAt.Format("2006-01-02 15:04:05")))
+	}
+	
+	output.WriteString("+----------------------+----------------------+---------------------+\n")
+	output.WriteString(fmt.Sprintf("%d user(s) found\n", len(users)))
+	
+	return output.String(), nil
+}
+
+// truncate truncates a string to a maximum length
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// checkPermission checks if the current user has permission to execute a statement
+func (ea *EngineAdapter) checkPermission(stmt *Statement) error {
+	// Get current user
+	user := ea.pagedEngine.currentUser
+	if user == "" {
+		user = "root@%" // Default to root if not set
+	}
+	
+	parts := strings.Split(user, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid user format: %s", user)
+	}
+	username, host := parts[0], parts[1]
+	
+	// Root user has all privileges
+	if username == "root" {
+		return nil
+	}
+	
+	// Determine required privilege based on statement type
+	var requiredPriv Privilege
+	database := stmt.Database
+	table := stmt.Table
+	
+	// Use current database if not specified
+	if database == "" {
+		database = ea.pagedEngine.currentDB
+	}
+	
+	switch stmt.Type {
+	case Select, DescribeTable:
+		requiredPriv = PrivilegeSelect
+	case Insert:
+		requiredPriv = PrivilegeInsert
+	case Update:
+		requiredPriv = PrivilegeUpdate
+	case Delete:
+		requiredPriv = PrivilegeDelete
+	case CreateTable, CreateDatabase:
+		requiredPriv = PrivilegeCreate
+		if table == "" {
+			table = "*"
+		}
+	case DropTable, DropDatabase:
+		requiredPriv = PrivilegeDrop
+		if table == "" {
+			table = "*"
+		}
+	case AlterTable:
+		requiredPriv = PrivilegeCreate // ALTER requires CREATE privilege
+	case CallProcedure:
+		requiredPriv = PrivilegeSelect // Calling procedures requires SELECT
+	default:
+		// For unknown types, allow (backward compatibility)
+		return nil
+	}
+	
+	// Check if user has the required privilege
+	if !ea.pagedEngine.userManager.HasPrivilege(username, host, database, table, requiredPriv) {
+		return fmt.Errorf("access denied for user '%s'@'%s' (missing %s privilege on %s.%s)", 
+			username, host, requiredPriv, database, table)
+	}
+	
+	return nil
+}
+
+// SetCurrentUser sets the current authenticated user
+func (ea *EngineAdapter) SetCurrentUser(username, host string) {
+	ea.pagedEngine.currentUser = fmt.Sprintf("%s@%s", username, host)
+}
+
+// Authenticate authenticates a user
+func (ea *EngineAdapter) Authenticate(username, password, host string) bool {
+	return ea.pagedEngine.userManager.Authenticate(username, password, host)
+}
+
+// LogLoginSuccess logs a successful login
+func (ea *EngineAdapter) LogLoginSuccess(username, host string) {
+	if ea.pagedEngine.auditLogger != nil {
+		ea.pagedEngine.auditLogger.LogLoginSuccess(username, host)
+	}
+}
+
+// LogLoginFailed logs a failed login attempt
+func (ea *EngineAdapter) LogLoginFailed(username, host, reason string) {
+	if ea.pagedEngine.auditLogger != nil {
+		ea.pagedEngine.auditLogger.LogLoginFailed(username, host, reason)
+	}
+}
+
+// IsAccountLocked checks if an account is locked
+func (ea *EngineAdapter) IsAccountLocked(username, host string) bool {
+	return ea.pagedEngine.userManager.IsLocked(username, host)
+}
+
+// alterUser changes a user's password
+func (ea *EngineAdapter) alterUser(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.ChangePassword(stmt.Username, stmt.Host, stmt.Password)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Password changed for '%s'@'%s'", stmt.Username, stmt.Host), nil
+}
+
+// createRole creates a new role
+func (ea *EngineAdapter) createRole(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.CreateRole(stmt.RoleName, "")
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Role '%s' created successfully", stmt.RoleName), nil
+}
+
+// dropRole removes a role
+func (ea *EngineAdapter) dropRole(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.DropRole(stmt.RoleName)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Role '%s' dropped successfully", stmt.RoleName), nil
+}
+
+// grantRole assigns a role to a user
+func (ea *EngineAdapter) grantRole(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.GrantRoleToUser(stmt.Username, stmt.Host, stmt.RoleName)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Role '%s' granted to '%s'@'%s'", stmt.RoleName, stmt.Username, stmt.Host), nil
+}
+
+// revokeRole removes a role from a user
+func (ea *EngineAdapter) revokeRole(stmt *Statement) (string, error) {
+	err := ea.pagedEngine.userManager.RevokeRoleFromUser(stmt.Username, stmt.Host, stmt.RoleName)
+	if err != nil {
+		return "", err
+	}
+	
+	// Save users to disk
+	if err := ea.pagedEngine.userManager.Save(); err != nil {
+		fmt.Printf("Warning: failed to save users: %v\n", err)
+	}
+	
+	return fmt.Sprintf("Role '%s' revoked from '%s'@'%s'", stmt.RoleName, stmt.Username, stmt.Host), nil
+}
+
+// showRoles shows all roles in the system
+func (ea *EngineAdapter) showRoles(stmt *Statement) (string, error) {
+	roles := ea.pagedEngine.userManager.ListRoles()
+	
+	if len(roles) == 0 {
+		return "No roles found", nil
+	}
+	
+	var output strings.Builder
+	output.WriteString("+----------------------+------------------------------------------+---------------------+\n")
+	output.WriteString("| Role                 | Description                              | Created             |\n")
+	output.WriteString("+----------------------+------------------------------------------+---------------------+\n")
+	
+	for _, role := range roles {
+		desc := role.Description
+		if desc == "" {
+			desc = "-"
+		}
+		output.WriteString(fmt.Sprintf("| %-20s | %-40s | %-19s |\n",
+			truncate(role.Name, 20),
+			truncate(desc, 40),
+			role.CreatedAt.Format("2006-01-02 15:04:05")))
+	}
+	
+	output.WriteString("+----------------------+------------------------------------------+---------------------+\n")
+	output.WriteString(fmt.Sprintf("%d role(s) found\n", len(roles)))
+	
+	return output.String(), nil
 }

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -210,4 +211,185 @@ func parseAffectedRows(result string) int {
 		return 1
 	}
 	return 0
+}
+
+// CreateProcedure creates a new WASM stored procedure
+func (a *Adapter) CreateProcedure(ctx context.Context, database, name, language, wasmBase64 string, params []interface{}, returnType, description string) error {
+	// Check context
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Switch database if specified
+	if database != "" {
+		if err := a.engine.UseDatabase(database); err != nil {
+			return fmt.Errorf("use database error: %w", err)
+		}
+	}
+
+	// Decode base64 WASM
+	wasmBytes, err := base64.StdEncoding.DecodeString(wasmBase64)
+	if err != nil {
+		return fmt.Errorf("failed to decode WASM: %w", err)
+	}
+
+	var columns []mindb.Column
+	var finalReturnType string
+
+	// If params or returnType not provided, introspect the WASM module
+	if len(params) == 0 || returnType == "" {
+		// Get WASM engine to introspect
+		wasmEngine := a.engine.GetWASMEngine()
+		if wasmEngine != nil {
+			introspectedParams, introspectedReturn, err := wasmEngine.IntrospectFunction(wasmBytes, name)
+			if err == nil {
+				// Use introspected values if not provided
+				if len(params) == 0 {
+					columns = introspectedParams
+				}
+				if returnType == "" {
+					finalReturnType = introspectedReturn
+				}
+			}
+		}
+	}
+
+	// If still no params, convert provided params to mindb.Column format
+	if len(columns) == 0 && len(params) > 0 {
+		columns = make([]mindb.Column, len(params))
+		for i, p := range params {
+			if paramMap, ok := p.(map[string]interface{}); ok {
+				columns[i] = mindb.Column{
+					Name:     paramMap["name"].(string),
+					DataType: paramMap["data_type"].(string),
+				}
+			}
+		}
+	}
+
+	// Use provided returnType if not introspected
+	if finalReturnType == "" {
+		finalReturnType = returnType
+	}
+
+	// Create stored procedure
+	proc := &mindb.StoredProcedure{
+		Name:        name,
+		Language:    language,
+		Code:        wasmBytes,
+		Params:      columns,
+		ReturnType:  finalReturnType,
+		Description: description,
+	}
+
+	return a.engine.CreateProcedureViaAdapter(proc)
+}
+
+// DropProcedure drops a stored procedure
+func (a *Adapter) DropProcedure(ctx context.Context, database, name string) error {
+	// Check context
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Switch database if specified
+	if database != "" {
+		if err := a.engine.UseDatabase(database); err != nil {
+			return fmt.Errorf("use database error: %w", err)
+		}
+	}
+
+	return a.engine.DropProcedureViaAdapter(name)
+}
+
+// ListProcedures lists all stored procedures
+func (a *Adapter) ListProcedures(ctx context.Context, database string) ([]interface{}, error) {
+	// Check context
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Switch database if specified
+	if database != "" {
+		if err := a.engine.UseDatabase(database); err != nil {
+			return nil, fmt.Errorf("use database error: %w", err)
+		}
+	}
+
+	procs := a.engine.ListProceduresViaAdapter()
+	
+	// Convert to interface{} slice
+	result := make([]interface{}, len(procs))
+	for i, proc := range procs {
+		// Convert params to interface{} slice
+		params := make([]interface{}, len(proc.Params))
+		for j, param := range proc.Params {
+			params[j] = map[string]interface{}{
+				"name":      param.Name,
+				"data_type": param.DataType,
+			}
+		}
+		
+		result[i] = map[string]interface{}{
+			"name":        proc.Name,
+			"language":    proc.Language,
+			"params":      params,
+			"return_type": proc.ReturnType,
+			"description": proc.Description,
+			"created_at":  proc.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			"updated_at":  proc.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		}
+	}
+
+	return result, nil
+}
+
+// CallProcedure executes a stored procedure
+func (a *Adapter) CallProcedure(ctx context.Context, database, name string, args ...interface{}) (interface{}, error) {
+	// Check context
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Switch database if specified
+	if database != "" {
+		if err := a.engine.UseDatabase(database); err != nil {
+			return nil, fmt.Errorf("use database error: %w", err)
+		}
+	}
+
+	return a.engine.CallProcedureViaAdapter(name, args...)
+}
+
+// Authenticate authenticates a user
+func (a *Adapter) Authenticate(username, password, host string) bool {
+	return a.engine.Authenticate(username, password, host)
+}
+
+// SetCurrentUser sets the current authenticated user
+func (a *Adapter) SetCurrentUser(username, host string) {
+	a.engine.SetCurrentUser(username, host)
+}
+
+// LogLoginSuccess logs a successful login
+func (a *Adapter) LogLoginSuccess(username, host string) {
+	a.engine.LogLoginSuccess(username, host)
+}
+
+// LogLoginFailed logs a failed login attempt
+func (a *Adapter) LogLoginFailed(username, host, reason string) {
+	a.engine.LogLoginFailed(username, host, reason)
+}
+
+// IsAccountLocked checks if an account is locked
+func (a *Adapter) IsAccountLocked(username, host string) bool {
+	return a.engine.IsAccountLocked(username, host)
 }

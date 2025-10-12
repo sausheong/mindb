@@ -2,9 +2,11 @@ package mindb
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,6 +40,11 @@ type PagedEngine struct {
 	catalog        *SystemCatalog
 	currentTxn     *Transaction // Current transaction (if any)
 	queryCache     *QueryCache  // Query result cache
+	wasmEngine     *WASMEngine  // WASM stored procedure engine
+	procedures     map[string]*StoredProcedure // Stored procedures
+	userManager    *UserManager // User authentication and authorization
+	auditLogger    *AuditLogger // Audit logging
+	currentUser    string       // Current authenticated user (username@host)
 	mu             sync.RWMutex
 }
 
@@ -54,6 +61,27 @@ func NewPagedEngineWithWAL(dataDir string, enableWAL bool) (*PagedEngine, error)
 	// Create system catalog
 	catalog := NewSystemCatalog(dataDir)
 	
+	// Initialize WASM engine for stored procedures
+	wasmEngine, err := NewWASMEngine(DefaultWASMConfig())
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize WASM engine: %v", err)
+	}
+	
+	// Create user manager
+	userManager := NewUserManager()
+	userManager.SetDataDir(dataDir)
+	
+	// Load users from disk
+	if err := userManager.Load(); err != nil {
+		return nil, fmt.Errorf("failed to load users: %v", err)
+	}
+	
+	// Create audit logger
+	auditLogger, err := NewAuditLogger(dataDir, true) // Enable by default
+	if err != nil {
+		return nil, fmt.Errorf("failed to create audit logger: %v", err)
+	}
+	
 	engine := &PagedEngine{
 		databases:     make(map[string]*PagedDatabase),
 		dataDir:       dataDir,
@@ -61,6 +89,11 @@ func NewPagedEngineWithWAL(dataDir string, enableWAL bool) (*PagedEngine, error)
 		vacuumManager: NewVacuumManager(txnManager),
 		catalog:       catalog,
 		queryCache:    NewQueryCache(60*time.Second, 1000), // 60s TTL, 1000 entries
+		wasmEngine:    wasmEngine,
+		procedures:    make(map[string]*StoredProcedure),
+		userManager:   userManager,
+		auditLogger:   auditLogger,
+		currentUser:   "root@%", // Default to root user
 	}
 	
 	// Load transaction state
@@ -99,6 +132,11 @@ func NewPagedEngineWithWAL(dataDir string, enableWAL bool) (*PagedEngine, error)
 	// Load existing databases
 	if err := engine.loadDatabases(); err != nil {
 		return nil, err
+	}
+	
+	// Load stored procedures
+	if err := engine.loadProcedures(); err != nil {
+		return nil, fmt.Errorf("failed to load procedures: %v", err)
 	}
 	
 	return engine, nil
@@ -240,6 +278,11 @@ func (e *PagedEngine) UseDatabase(name string) error {
 	
 	e.currentDB = name
 	return nil
+}
+
+// GetWASMEngine returns the WASM engine for introspection
+func (e *PagedEngine) GetWASMEngine() *WASMEngine {
+	return e.wasmEngine
 }
 
 // getCurrentDatabase returns the current database
@@ -1025,9 +1068,241 @@ func (e *PagedEngine) Close() error {
 		return fmt.Errorf("failed to save transaction state: %v", err)
 	}
 	
+	// Close WASM engine
+	if e.wasmEngine != nil {
+		if err := e.wasmEngine.Close(); err != nil {
+			return fmt.Errorf("failed to close WASM engine: %v", err)
+		}
+	}
+	
 	// Close WAL
 	if e.walManager != nil {
 		return e.walManager.Close()
+	}
+	
+	return nil
+}
+
+// CreateProcedure creates a new stored procedure
+func (e *PagedEngine) CreateProcedure(proc *StoredProcedure) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
+	// Check if procedure already exists
+	if _, exists := e.procedures[proc.Name]; exists {
+		return fmt.Errorf("procedure '%s' already exists", proc.Name)
+	}
+	
+	// Compile the WASM module
+	if err := e.wasmEngine.CompileModule(proc.Name, proc.Code); err != nil {
+		return fmt.Errorf("failed to compile procedure: %w", err)
+	}
+	
+	// Store procedure metadata
+	proc.CreatedAt = time.Now()
+	proc.UpdatedAt = time.Now()
+	e.procedures[proc.Name] = proc
+	
+	// Persist to disk
+	if err := e.saveProcedure(proc); err != nil {
+		return fmt.Errorf("failed to persist procedure: %w", err)
+	}
+	
+	return nil
+}
+
+// DropProcedure drops a stored procedure
+func (e *PagedEngine) DropProcedure(name string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
+	// Check if procedure exists
+	if _, exists := e.procedures[name]; !exists {
+		return fmt.Errorf("procedure '%s' does not exist", name)
+	}
+	
+	// Remove from WASM engine
+	e.wasmEngine.RemoveModule(name)
+	
+	// Remove from procedures map
+	delete(e.procedures, name)
+	
+	// Delete from disk
+	if err := e.deleteProcedure(name); err != nil {
+		return fmt.Errorf("failed to delete procedure file: %w", err)
+	}
+	
+	return nil
+}
+
+// CallProcedure executes a stored procedure
+func (e *PagedEngine) CallProcedure(name string, args ...interface{}) (interface{}, error) {
+	e.mu.RLock()
+	proc, exists := e.procedures[name]
+	e.mu.RUnlock()
+	
+	if !exists {
+		return nil, fmt.Errorf("procedure '%s' does not exist", name)
+	}
+	
+	// Convert args based on parameter types
+	convertedArgs := make([]interface{}, len(args))
+	for i, arg := range args {
+		if i < len(proc.Params) {
+			// Convert based on expected type
+			convertedArgs[i] = convertToWASMType(arg, proc.Params[i].DataType)
+		} else {
+			convertedArgs[i] = arg
+		}
+	}
+	
+	// Create execution context
+	ctx := &ExecutionContext{
+		Engine:   e,
+		Database: e.currentDB,
+	}
+	
+	// Execute the procedure (use procedure name as function name by default)
+	return e.wasmEngine.ExecuteWithContext(name, name, ctx, convertedArgs...)
+}
+
+// convertToWASMType converts a value to the appropriate WASM type
+func convertToWASMType(value interface{}, targetType string) interface{} {
+	switch targetType {
+	case "INT", "BIGINT":
+		// Convert to int32 for WASM i32
+		switch v := value.(type) {
+		case int:
+			return int32(v)
+		case int64:
+			return int32(v)
+		case float64:
+			return int32(v)
+		case int32:
+			return v
+		default:
+			return value
+		}
+	case "FLOAT":
+		// Convert to float64 for WASM f64
+		switch v := value.(type) {
+		case float64:
+			return v
+		case float32:
+			return float64(v)
+		case int:
+			return float64(v)
+		case int32:
+			return float64(v)
+		case int64:
+			return float64(v)
+		default:
+			return value
+		}
+	default:
+		return value
+	}
+}
+
+// ListProcedures returns all stored procedures
+func (e *PagedEngine) ListProcedures() []*StoredProcedure {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	
+	procs := make([]*StoredProcedure, 0, len(e.procedures))
+	for _, proc := range e.procedures {
+		procs = append(procs, proc)
+	}
+	
+	return procs
+}
+
+// GetProcedure returns a stored procedure by name
+func (e *PagedEngine) GetProcedure(name string) (*StoredProcedure, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	
+	proc, exists := e.procedures[name]
+	if !exists {
+		return nil, fmt.Errorf("procedure '%s' does not exist", name)
+	}
+	
+	return proc, nil
+}
+
+// saveProcedure persists a stored procedure to disk
+func (e *PagedEngine) saveProcedure(proc *StoredProcedure) error {
+	// Create procedures directory if it doesn't exist
+	procDir := filepath.Join(e.dataDir, "procedures")
+	if err := os.MkdirAll(procDir, 0755); err != nil {
+		return fmt.Errorf("failed to create procedures directory: %w", err)
+	}
+	
+	// Serialize procedure to JSON
+	data, err := json.Marshal(proc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal procedure: %w", err)
+	}
+	
+	// Write to file
+	filename := filepath.Join(procDir, proc.Name+".json")
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("failed to write procedure file: %w", err)
+	}
+	
+	return nil
+}
+
+// deleteProcedure removes a stored procedure file from disk
+func (e *PagedEngine) deleteProcedure(name string) error {
+	filename := filepath.Join(e.dataDir, "procedures", name+".json")
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete procedure file: %w", err)
+	}
+	return nil
+}
+
+// loadProcedures loads all stored procedures from disk
+func (e *PagedEngine) loadProcedures() error {
+	procDir := filepath.Join(e.dataDir, "procedures")
+	
+	// Check if procedures directory exists
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return nil // No procedures to load
+	}
+	
+	// Read all procedure files
+	files, err := os.ReadDir(procDir)
+	if err != nil {
+		return fmt.Errorf("failed to read procedures directory: %w", err)
+	}
+	
+	// Load each procedure
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		
+		// Read file
+		filename := filepath.Join(procDir, file.Name())
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return fmt.Errorf("failed to read procedure file %s: %w", file.Name(), err)
+		}
+		
+		// Unmarshal procedure
+		var proc StoredProcedure
+		if err := json.Unmarshal(data, &proc); err != nil {
+			return fmt.Errorf("failed to unmarshal procedure %s: %w", file.Name(), err)
+		}
+		
+		// Compile WASM module
+		if err := e.wasmEngine.CompileModule(proc.Name, proc.Code); err != nil {
+			return fmt.Errorf("failed to compile procedure %s: %w", proc.Name, err)
+		}
+		
+		// Store in memory
+		e.procedures[proc.Name] = &proc
 	}
 	
 	return nil

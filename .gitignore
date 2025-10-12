@@ -2,12 +2,11 @@
 docs
 cmd/mindb-server/data
 cmd/mindb-server/docs
-mindb
 data
 cmd/mindb-server/performance_results
 cmd/mindb-server/perf_test_data
 cmd/mindb-server/perf_final_test
 cmd/mindb-server/test_data
 cmd/mindb-server/phase3_test
-coverage.out
+*.out
 coverage.html

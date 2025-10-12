@@ -512,3 +512,402 @@ func TestEngineAdapter_ConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
+
+// ============================================================================
+// ADDITIONAL COMPREHENSIVE TESTS
+// ============================================================================
+
+func TestEngineAdapter_MultipleStatementTypes(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Create database
+	_, err = adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	if err != nil {
+		t.Fatalf("CREATE DATABASE failed: %v", err)
+	}
+
+	adapter.UseDatabase("testdb")
+
+	// Create table
+	_, err = adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "products",
+		Columns: []Column{
+			{Name: "id", DataType: "INT", PrimaryKey: true},
+			{Name: "name", DataType: "VARCHAR"},
+			{Name: "price", DataType: "INT"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+
+	// Insert multiple rows
+	_, err = adapter.Execute(&Statement{
+		Type:  Insert,
+		Table: "products",
+		Columns: []Column{
+			{Name: "id"},
+			{Name: "name"},
+			{Name: "price"},
+		},
+		Values: [][]interface{}{
+			{1, "Product A", 100},
+			{2, "Product B", 200},
+			{3, "Product C", 300},
+		},
+	})
+	if err != nil {
+		t.Fatalf("INSERT failed: %v", err)
+	}
+
+	// Select all
+	result, err := adapter.Execute(&Statement{
+		Type:  Select,
+		Table: "products",
+	})
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	if result == "" {
+		t.Error("Expected data from SELECT")
+	}
+
+	// Update
+	_, err = adapter.Execute(&Statement{
+		Type:  Update,
+		Table: "products",
+		Updates: map[string]interface{}{
+			"price": 150,
+		},
+		Conditions: []Condition{
+			{Column: "id", Operator: "=", Value: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UPDATE failed: %v", err)
+	}
+
+	// Delete
+	_, err = adapter.Execute(&Statement{
+		Type:  Delete,
+		Table: "products",
+		Conditions: []Condition{
+			{Column: "id", Operator: "=", Value: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DELETE failed: %v", err)
+	}
+
+	// Describe table
+	result, err = adapter.Execute(&Statement{
+		Type:  DescribeTable,
+		Table: "products",
+	})
+	if err != nil {
+		t.Fatalf("DESCRIBE TABLE failed: %v", err)
+	}
+	if result == "" {
+		t.Error("Expected result from DESCRIBE TABLE")
+	}
+
+	// Drop table
+	_, err = adapter.Execute(&Statement{
+		Type:  DropTable,
+		Table: "products",
+	})
+	if err != nil {
+		t.Fatalf("DROP TABLE failed: %v", err)
+	}
+
+	// Drop database
+	_, err = adapter.Execute(&Statement{
+		Type:     DropDatabase,
+		Database: "testdb",
+	})
+	if err != nil {
+		t.Fatalf("DROP DATABASE failed: %v", err)
+	}
+}
+
+func TestEngineAdapter_ComplexQueries(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Setup
+	adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	adapter.UseDatabase("testdb")
+	adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "employees",
+		Columns: []Column{
+			{Name: "id", DataType: "INT", PrimaryKey: true},
+			{Name: "name", DataType: "VARCHAR"},
+			{Name: "age", DataType: "INT"},
+			{Name: "department", DataType: "VARCHAR"},
+		},
+	})
+
+	// Insert test data
+	adapter.Execute(&Statement{
+		Type:  Insert,
+		Table: "employees",
+		Columns: []Column{
+			{Name: "id"},
+			{Name: "name"},
+			{Name: "age"},
+			{Name: "department"},
+		},
+		Values: [][]interface{}{
+			{1, "Alice", 30, "Engineering"},
+			{2, "Bob", 25, "Sales"},
+			{3, "Charlie", 35, "Engineering"},
+			{4, "David", 28, "Marketing"},
+		},
+	})
+
+	// Query with multiple conditions
+	result, err := adapter.Execute(&Statement{
+		Type:  Select,
+		Table: "employees",
+		Conditions: []Condition{
+			{Column: "age", Operator: ">", Value: 26},
+			{Column: "department", Operator: "=", Value: "Engineering"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Complex SELECT failed: %v", err)
+	}
+	if result == "" {
+		t.Error("Expected data from complex SELECT")
+	}
+}
+
+func TestEngineAdapter_GetWASMEngine(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	wasmEngine := adapter.GetWASMEngine()
+	if wasmEngine == nil {
+		t.Error("GetWASMEngine should return WASM engine")
+	}
+}
+
+func TestEngineAdapter_UnsupportedStatementType(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Try unsupported statement type
+	_, err = adapter.Execute(&Statement{
+		Type: StatementType(9999), // Invalid type
+	})
+	if err == nil {
+		t.Error("Should fail for unsupported statement type")
+	}
+}
+
+func TestEngineAdapter_EmptyResults(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Setup
+	adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	adapter.UseDatabase("testdb")
+	adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "empty_table",
+		Columns: []Column{
+			{Name: "id", DataType: "INT"},
+		},
+	})
+
+	// Select from empty table
+	result, err := adapter.Execute(&Statement{
+		Type:  Select,
+		Table: "empty_table",
+	})
+	if err != nil {
+		t.Fatalf("SELECT from empty table failed: %v", err)
+	}
+	// Should return result even if empty
+	if result == "" {
+		t.Log("Empty result is acceptable for empty table")
+	}
+}
+
+func TestEngineAdapter_LargeDataset(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Setup
+	adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	adapter.UseDatabase("testdb")
+	adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "large_table",
+		Columns: []Column{
+			{Name: "id", DataType: "INT", PrimaryKey: true},
+			{Name: "value", DataType: "INT"},
+		},
+	})
+
+	// Insert many rows
+	for i := 0; i < 50; i++ {
+		adapter.Execute(&Statement{
+			Type:  Insert,
+			Table: "large_table",
+			Columns: []Column{
+				{Name: "id"},
+				{Name: "value"},
+			},
+			Values: [][]interface{}{
+				{i, i * 10},
+			},
+		})
+	}
+
+	// Query the data
+	result, err := adapter.Execute(&Statement{
+		Type:  Select,
+		Table: "large_table",
+	})
+	if err != nil {
+		t.Fatalf("SELECT from large table failed: %v", err)
+	}
+	if result == "" {
+		t.Error("Expected data from large table")
+	}
+}
+
+func TestEngineAdapter_MultipleUpdates(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Setup
+	adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	adapter.UseDatabase("testdb")
+	adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "items",
+		Columns: []Column{
+			{Name: "id", DataType: "INT", PrimaryKey: true},
+			{Name: "status", DataType: "VARCHAR"},
+			{Name: "count", DataType: "INT"},
+		},
+	})
+
+	// Insert data
+	adapter.Execute(&Statement{
+		Type:  Insert,
+		Table: "items",
+		Columns: []Column{
+			{Name: "id"},
+			{Name: "status"},
+			{Name: "count"},
+		},
+		Values: [][]interface{}{
+			{1, "active", 10},
+			{2, "active", 20},
+			{3, "inactive", 30},
+		},
+	})
+
+	// Update multiple columns
+	_, err = adapter.Execute(&Statement{
+		Type:  Update,
+		Table: "items",
+		Updates: map[string]interface{}{
+			"status": "archived",
+			"count":  0,
+		},
+		Conditions: []Condition{
+			{Column: "id", Operator: "=", Value: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Multiple column UPDATE failed: %v", err)
+	}
+}
+
+func TestEngineAdapter_DeleteWithoutConditions(t *testing.T) {
+	tmpDir := t.TempDir()
+	
+	adapter, err := NewEngineAdapter(tmpDir, false)
+	if err != nil {
+		t.Fatalf("Failed to create adapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Setup
+	adapter.Execute(&Statement{Type: CreateDatabase, Database: "testdb"})
+	adapter.UseDatabase("testdb")
+	adapter.Execute(&Statement{
+		Type:  CreateTable,
+		Table: "temp_data",
+		Columns: []Column{
+			{Name: "id", DataType: "INT"},
+		},
+	})
+
+	// Insert data
+	adapter.Execute(&Statement{
+		Type:  Insert,
+		Table: "temp_data",
+		Columns: []Column{
+			{Name: "id"},
+		},
+		Values: [][]interface{}{
+			{1},
+			{2},
+			{3},
+		},
+	})
+
+	// Delete all (no conditions)
+	_, err = adapter.Execute(&Statement{
+		Type:       Delete,
+		Table:      "temp_data",
+		Conditions: nil,
+	})
+	// Should either work or fail gracefully
+	if err != nil {
+		t.Logf("DELETE without conditions: %v", err)
+	}
+}

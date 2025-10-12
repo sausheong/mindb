@@ -448,3 +448,225 @@ func (h *Handlers) BatchQueryHandler() http.HandlerFunc {
 			Msg("batch_query_completed")
 	}
 }
+
+// CreateProcedureHandler handles POST /procedures
+func (h *Handlers) CreateProcedureHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Parse request
+		var req CreateProcedureRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+
+		// Validate request
+		if req.Name == "" {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "procedure name is required")
+			return
+		}
+		if req.WasmBase64 == "" {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "wasm_base64 is required")
+			return
+		}
+		if req.Language == "" {
+			req.Language = "wasm" // Default to wasm
+		}
+
+		// Get database from header
+		dbName := r.Header.Get("X-Mindb-Database")
+
+		// Create execution context with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), h.stmtTimeout)
+		defer cancel()
+
+		// Convert Params to []interface{}
+		params := make([]interface{}, len(req.Params))
+		for i, p := range req.Params {
+			params[i] = map[string]interface{}{
+				"name":      p.Name,
+				"data_type": p.DataType,
+			}
+		}
+
+		// Create procedure via database adapter
+		err := h.db.CreateProcedure(ctx, dbName, req.Name, req.Language, req.WasmBase64, params, req.ReturnType, req.Description)
+		if err != nil {
+			h.logger.Error().Err(err).Str("procedure", req.Name).Msg("create_procedure_failed")
+			writeError(w, http.StatusInternalServerError, ErrCodeInternal, "failed to create procedure: "+err.Error())
+			return
+		}
+
+		// Write response
+		resp := CreateProcedureResponse{
+			Name:      req.Name,
+			Message:   "Procedure created successfully",
+			LatencyMS: time.Since(start).Milliseconds(),
+		}
+		writeJSON(w, http.StatusCreated, resp)
+
+		h.logger.Info().
+			Str("procedure", req.Name).
+			Str("language", req.Language).
+			Int64("latency_ms", time.Since(start).Milliseconds()).
+			Msg("procedure_created")
+	}
+}
+
+// DropProcedureHandler handles DELETE /procedures/:name
+func (h *Handlers) DropProcedureHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Get procedure name from URL
+		procName := chi.URLParam(r, "name")
+		if procName == "" {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "procedure name is required")
+			return
+		}
+
+		// Get database from header
+		dbName := r.Header.Get("X-Mindb-Database")
+
+		// Create execution context with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), h.stmtTimeout)
+		defer cancel()
+
+		// Drop procedure via database adapter
+		err := h.db.DropProcedure(ctx, dbName, procName)
+		if err != nil {
+			h.logger.Error().Err(err).Str("procedure", procName).Msg("drop_procedure_failed")
+			writeError(w, http.StatusInternalServerError, ErrCodeInternal, "failed to drop procedure: "+err.Error())
+			return
+		}
+
+		// Write response
+		resp := DropProcedureResponse{
+			Name:      procName,
+			Message:   "Procedure dropped successfully",
+			LatencyMS: time.Since(start).Milliseconds(),
+		}
+		writeJSON(w, http.StatusOK, resp)
+
+		h.logger.Info().
+			Str("procedure", procName).
+			Int64("latency_ms", time.Since(start).Milliseconds()).
+			Msg("procedure_dropped")
+	}
+}
+
+// ListProceduresHandler handles GET /procedures
+func (h *Handlers) ListProceduresHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Get database from header
+		dbName := r.Header.Get("X-Mindb-Database")
+
+		// Create execution context with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), h.stmtTimeout)
+		defer cancel()
+
+		// List procedures via database adapter
+		procedures, err := h.db.ListProcedures(ctx, dbName)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("list_procedures_failed")
+			writeError(w, http.StatusInternalServerError, ErrCodeInternal, "failed to list procedures: "+err.Error())
+			return
+		}
+
+		// Convert procedures to ProcedureInfo
+		procInfos := make([]ProcedureInfo, len(procedures))
+		for i, p := range procedures {
+			if procMap, ok := p.(map[string]interface{}); ok {
+				// Extract params if present
+				var params []Param
+				if paramsInterface, ok := procMap["params"]; ok {
+					if paramsList, ok := paramsInterface.([]interface{}); ok {
+						params = make([]Param, len(paramsList))
+						for j, paramInterface := range paramsList {
+							if paramMap, ok := paramInterface.(map[string]interface{}); ok {
+								params[j] = Param{
+									Name:     paramMap["name"].(string),
+									DataType: paramMap["data_type"].(string),
+								}
+							}
+						}
+					}
+				}
+				
+				procInfos[i] = ProcedureInfo{
+					Name:        procMap["name"].(string),
+					Language:    procMap["language"].(string),
+					Params:      params,
+					ReturnType:  procMap["return_type"].(string),
+					Description: procMap["description"].(string),
+					CreatedAt:   procMap["created_at"].(string),
+					UpdatedAt:   procMap["updated_at"].(string),
+				}
+			}
+		}
+
+		// Write response
+		resp := ListProceduresResponse{
+			Procedures: procInfos,
+			Count:      len(procInfos),
+			LatencyMS:  time.Since(start).Milliseconds(),
+		}
+		writeJSON(w, http.StatusOK, resp)
+
+		h.logger.Info().
+			Int("count", len(procedures)).
+			Int64("latency_ms", time.Since(start).Milliseconds()).
+			Msg("procedures_listed")
+	}
+}
+
+// CallProcedureHandler handles POST /procedures/:name/call
+func (h *Handlers) CallProcedureHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Get procedure name from URL
+		procName := chi.URLParam(r, "name")
+		if procName == "" {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "procedure name is required")
+			return
+		}
+
+		// Parse request
+		var req CallProcedureRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+
+		// Get database from header
+		dbName := r.Header.Get("X-Mindb-Database")
+
+		// Create execution context with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), h.stmtTimeout)
+		defer cancel()
+
+		// Call procedure via database adapter
+		result, err := h.db.CallProcedure(ctx, dbName, procName, req.Args...)
+		if err != nil {
+			h.logger.Error().Err(err).Str("procedure", procName).Msg("call_procedure_failed")
+			writeError(w, http.StatusInternalServerError, ErrCodeInternal, "failed to call procedure: "+err.Error())
+			return
+		}
+
+		// Write response
+		resp := CallProcedureResponse{
+			Result:    result,
+			LatencyMS: time.Since(start).Milliseconds(),
+		}
+		writeJSON(w, http.StatusOK, resp)
+
+		h.logger.Info().
+			Str("procedure", procName).
+			Int64("latency_ms", time.Since(start).Milliseconds()).
+			Msg("procedure_called")
+	}
+}

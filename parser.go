@@ -22,6 +22,22 @@ const (
 	BeginTransaction
 	CommitTransaction
 	RollbackTransaction
+	CreateProcedure
+	DropProcedure
+	CallProcedure
+	DescribeTable
+	CreateUser
+	DropUser
+	AlterUser
+	GrantPrivileges
+	RevokePrivileges
+	ShowGrants
+	ShowUsers
+	CreateRole
+	DropRole
+	GrantRole
+	RevokeRole
+	ShowRoles
 	Unknown
 )
 
@@ -48,6 +64,19 @@ type Statement struct {
 	Joins       []JoinClause
 	Aggregates  []AggregateFunc
 	Subquery    *Statement
+	// Stored procedure fields
+	ProcedureName string
+	ProcedureCode []byte
+	ProcedureLang string
+	ProcedureArgs []interface{}
+	ReturnType    string
+	// User management fields
+	Username    string
+	Password    string
+	Host        string
+	Privileges  []string
+	RoleName    string
+	Description string
 }
 
 // Column represents a table column
@@ -166,6 +195,38 @@ func (p *Parser) Parse(sql string) (*Statement, error) {
 		return p.parseUpdate(sql)
 	case strings.HasPrefix(sqlUpper, "DELETE FROM"):
 		return p.parseDelete(sql)
+	case strings.HasPrefix(sqlUpper, "CREATE PROCEDURE"):
+		return p.parseCreateProcedure(sql)
+	case strings.HasPrefix(sqlUpper, "DROP PROCEDURE"):
+		return p.parseDropProcedure(sql)
+	case strings.HasPrefix(sqlUpper, "CALL"):
+		return p.parseCallProcedure(sql)
+	case strings.HasPrefix(sqlUpper, "DESCRIBE"), strings.HasPrefix(sqlUpper, "DESC "):
+		return p.parseDescribeTable(sql)
+	case strings.HasPrefix(sqlUpper, "CREATE USER"):
+		return p.parseCreateUser(sql)
+	case strings.HasPrefix(sqlUpper, "DROP USER"):
+		return p.parseDropUser(sql)
+	case strings.HasPrefix(sqlUpper, "GRANT"):
+		return p.parseGrant(sql)
+	case strings.HasPrefix(sqlUpper, "REVOKE"):
+		return p.parseRevoke(sql)
+	case strings.HasPrefix(sqlUpper, "SHOW GRANTS"):
+		return p.parseShowGrants(sql)
+	case strings.HasPrefix(sqlUpper, "SHOW USERS"):
+		return p.parseShowUsers(sql)
+	case strings.HasPrefix(sqlUpper, "ALTER USER"):
+		return p.parseAlterUser(sql)
+	case strings.HasPrefix(sqlUpper, "CREATE ROLE"):
+		return p.parseCreateRole(sql)
+	case strings.HasPrefix(sqlUpper, "DROP ROLE"):
+		return p.parseDropRole(sql)
+	case strings.HasPrefix(sqlUpper, "SHOW ROLES"):
+		return p.parseShowRoles(sql)
+	case strings.HasPrefix(sqlUpper, "GRANT") && strings.Contains(sqlUpper, "TO") && !strings.Contains(sqlUpper, "ON"):
+		return p.parseGrantRole(sql)
+	case strings.HasPrefix(sqlUpper, "REVOKE") && strings.Contains(sqlUpper, "FROM") && !strings.Contains(sqlUpper, "ON"):
+		return p.parseRevokeRole(sql)
 	default:
 		return &Statement{Type: Unknown}, fmt.Errorf("unknown statement type")
 	}
@@ -949,4 +1010,318 @@ func (p *Parser) parseAggregateFunctions(columnsStr string) ([]AggregateFunc, er
 	}
 
 	return aggregates, nil
+}
+
+// parseCreateProcedure parses CREATE PROCEDURE statement
+func (p *Parser) parseCreateProcedure(sql string) (*Statement, error) {
+	// Syntax: CREATE PROCEDURE name(params) RETURNS type LANGUAGE lang AS 'base64_code'
+	re := regexp.MustCompile(`(?i)CREATE\s+PROCEDURE\s+(\w+)\s*\((.*?)\)\s+RETURNS\s+(\w+)\s+LANGUAGE\s+(\w+)\s+AS\s+'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 6 {
+		return nil, fmt.Errorf("invalid CREATE PROCEDURE syntax")
+	}
+	
+	stmt := &Statement{
+		Type:          CreateProcedure,
+		ProcedureName: matches[1],
+		ReturnType:    matches[3],
+		ProcedureLang: matches[4],
+	}
+	
+	// Parse parameters
+	if matches[2] != "" {
+		params, err := p.parseColumnDefinitions(matches[2])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse parameters: %w", err)
+		}
+		stmt.Columns = params
+	}
+	
+	// Decode base64 WASM code
+	stmt.ProcedureCode = []byte(matches[5]) // Store as-is, will decode in engine
+	
+	return stmt, nil
+}
+
+// parseDropProcedure parses DROP PROCEDURE statement
+func (p *Parser) parseDropProcedure(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)DROP\s+PROCEDURE\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DROP PROCEDURE syntax")
+	}
+	
+	stmt := &Statement{
+		Type:          DropProcedure,
+		ProcedureName: matches[1],
+	}
+	
+	// Check for IF EXISTS
+	if strings.Contains(strings.ToUpper(sql), "IF EXISTS") {
+		stmt.IfExists = true
+	}
+	
+	return stmt, nil
+}
+
+// parseCallProcedure parses CALL statement
+func (p *Parser) parseCallProcedure(sql string) (*Statement, error) {
+	// Syntax: CALL procedure_name(arg1, arg2, ...)
+	re := regexp.MustCompile(`(?i)CALL\s+(\w+)\s*\((.*?)\)`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid CALL syntax")
+	}
+	
+	stmt := &Statement{
+		Type:          CallProcedure,
+		ProcedureName: matches[1],
+	}
+	
+	// Parse arguments
+	if len(matches) >= 3 && matches[2] != "" {
+		args, err := p.parseValues(matches[2])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse arguments: %w", err)
+		}
+		stmt.ProcedureArgs = args
+	}
+	
+	return stmt, nil
+}
+
+// parseCreateUser parses CREATE USER statement
+// Syntax: CREATE USER 'username'@'host' IDENTIFIED BY 'password';
+func (p *Parser) parseCreateUser(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)CREATE\s+USER\s+'([^']+)'@'([^']+)'\s+IDENTIFIED\s+BY\s+'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 4 {
+		return nil, fmt.Errorf("invalid CREATE USER syntax")
+	}
+	
+	return &Statement{
+		Type:     CreateUser,
+		Username: matches[1],
+		Host:     matches[2],
+		Password: matches[3],
+	}, nil
+}
+
+// parseDropUser parses DROP USER statement
+// Syntax: DROP USER 'username'@'host';
+func (p *Parser) parseDropUser(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)DROP\s+USER\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 3 {
+		return nil, fmt.Errorf("invalid DROP USER syntax")
+	}
+	
+	return &Statement{
+		Type:     DropUser,
+		Username: matches[1],
+		Host:     matches[2],
+	}, nil
+}
+
+// parseGrant parses GRANT statement
+// Syntax: GRANT privileges ON database.table TO 'username'@'host';
+func (p *Parser) parseGrant(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)GRANT\s+([\w\s,]+)\s+ON\s+([^.]+)\.([^\s]+)\s+TO\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 6 {
+		return nil, fmt.Errorf("invalid GRANT syntax")
+	}
+	
+	// Parse privileges
+	privStr := strings.ToUpper(strings.TrimSpace(matches[1]))
+	var privileges []string
+	if privStr == "ALL" || privStr == "ALL PRIVILEGES" {
+		privileges = []string{"ALL"}
+	} else {
+		privs := strings.Split(privStr, ",")
+		for _, p := range privs {
+			privileges = append(privileges, strings.TrimSpace(p))
+		}
+	}
+	
+	return &Statement{
+		Type:       GrantPrivileges,
+		Privileges: privileges,
+		Database:   matches[2],
+		Table:      matches[3],
+		Username:   matches[4],
+		Host:       matches[5],
+	}, nil
+}
+
+// parseRevoke parses REVOKE statement
+// Syntax: REVOKE privileges ON database.table FROM 'username'@'host';
+func (p *Parser) parseRevoke(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)REVOKE\s+([\w\s,]+)\s+ON\s+([^.]+)\.([^\s]+)\s+FROM\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 6 {
+		return nil, fmt.Errorf("invalid REVOKE syntax")
+	}
+	
+	// Parse privileges
+	privStr := strings.ToUpper(strings.TrimSpace(matches[1]))
+	var privileges []string
+	if privStr == "ALL" || privStr == "ALL PRIVILEGES" {
+		privileges = []string{"ALL"}
+	} else {
+		privs := strings.Split(privStr, ",")
+		for _, p := range privs {
+			privileges = append(privileges, strings.TrimSpace(p))
+		}
+	}
+	
+	return &Statement{
+		Type:       RevokePrivileges,
+		Privileges: privileges,
+		Database:   matches[2],
+		Table:      matches[3],
+		Username:   matches[4],
+		Host:       matches[5],
+	}, nil
+}
+
+// parseShowGrants parses SHOW GRANTS statement
+// Syntax: SHOW GRANTS FOR 'username'@'host';
+func (p *Parser) parseShowGrants(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)SHOW\s+GRANTS\s+FOR\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 3 {
+		return nil, fmt.Errorf("invalid SHOW GRANTS syntax")
+	}
+	
+	return &Statement{
+		Type:     ShowGrants,
+		Username: matches[1],
+		Host:     matches[2],
+	}, nil
+}
+
+// parseShowUsers parses SHOW USERS statement
+// Syntax: SHOW USERS;
+func (p *Parser) parseShowUsers(sql string) (*Statement, error) {
+	return &Statement{
+		Type: ShowUsers,
+	}, nil
+}
+
+// parseAlterUser parses ALTER USER statement
+// Syntax: ALTER USER 'username'@'host' IDENTIFIED BY 'newpassword';
+func (p *Parser) parseAlterUser(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)ALTER\s+USER\s+'([^']+)'@'([^']+)'\s+IDENTIFIED\s+BY\s+'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 4 {
+		return nil, fmt.Errorf("invalid ALTER USER syntax")
+	}
+	
+	return &Statement{
+		Type:     AlterUser,
+		Username: matches[1],
+		Host:     matches[2],
+		Password: matches[3],
+	}, nil
+}
+
+// parseCreateRole parses CREATE ROLE statement
+// Syntax: CREATE ROLE 'rolename';
+func (p *Parser) parseCreateRole(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)CREATE\s+ROLE\s+'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid CREATE ROLE syntax")
+	}
+	
+	return &Statement{
+		Type:     CreateRole,
+		RoleName: matches[1],
+	}, nil
+}
+
+// parseDropRole parses DROP ROLE statement
+// Syntax: DROP ROLE 'rolename';
+func (p *Parser) parseDropRole(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)DROP\s+ROLE\s+'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DROP ROLE syntax")
+	}
+	
+	return &Statement{
+		Type:     DropRole,
+		RoleName: matches[1],
+	}, nil
+}
+
+// parseShowRoles parses SHOW ROLES statement
+// Syntax: SHOW ROLES;
+func (p *Parser) parseShowRoles(sql string) (*Statement, error) {
+	return &Statement{
+		Type: ShowRoles,
+	}, nil
+}
+
+// parseGrantRole parses GRANT role TO user statement
+// Syntax: GRANT 'rolename' TO 'username'@'host';
+func (p *Parser) parseGrantRole(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)GRANT\s+'([^']+)'\s+TO\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 4 {
+		return nil, fmt.Errorf("invalid GRANT role syntax")
+	}
+	
+	return &Statement{
+		Type:     GrantRole,
+		RoleName: matches[1],
+		Username: matches[2],
+		Host:     matches[3],
+	}, nil
+}
+
+// parseRevokeRole parses REVOKE role FROM user statement
+// Syntax: REVOKE 'rolename' FROM 'username'@'host';
+func (p *Parser) parseRevokeRole(sql string) (*Statement, error) {
+	re := regexp.MustCompile(`(?i)REVOKE\s+'([^']+)'\s+FROM\s+'([^']+)'@'([^']+)'`)
+	matches := re.FindStringSubmatch(sql)
+	
+	if len(matches) < 4 {
+		return nil, fmt.Errorf("invalid REVOKE role syntax")
+	}
+	
+	return &Statement{
+		Type:     RevokeRole,
+		RoleName: matches[1],
+		Username: matches[2],
+		Host:     matches[3],
+	}, nil
+}
+
+// parseDescribeTable parses DESCRIBE or DESC statement
+func (p *Parser) parseDescribeTable(sql string) (*Statement, error) {
+	// Match: DESCRIBE table_name or DESC table_name
+	re := regexp.MustCompile(`(?i)(?:DESCRIBE|DESC)\s+(\w+)`)
+	matches := re.FindStringSubmatch(sql)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid DESCRIBE syntax")
+	}
+
+	return &Statement{
+		Type:  DescribeTable,
+		Table: matches[1],
+	}, nil
 }

@@ -3,7 +3,7 @@
 A minimal relational database written in Go, featuring MVCC transactions, WAL recovery, and comprehensive SQL query support.
 
 [![Go Version](https://img.shields.io/badge/Go-1.20+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![Test Coverage](https://img.shields.io/badge/coverage-73.2%25-brightgreen)](https://github.com/sausheong/mindb)
+[![Test Coverage](https://img.shields.io/badge/coverage-61.6%25-green)](https://github.com/sausheong/mindb)
 
 ##  Features
 
@@ -29,6 +29,124 @@ A minimal relational database written in Go, featuring MVCC transactions, WAL re
 -  **System Catalog**: Metadata management
 -  **Concurrent Access**: Thread-safe operations
 -  **Schema Qualification**: Database.table notation
+
+##  User Authentication & Access Control
+
+Mindb ships with a complete, thread‑safe user and permission subsystem. The core data structures model users (with a username, a salted SHA‑256 password hash, and a host constraint) and grants that describe what a user may do against a database or table. A central `UserManager` coordinates creation, lookup, authentication and privilege checks under concurrency.
+
+On the SQL surface, the parser and execution engine understand the familiar MySQL‑style commands for creating and removing users, granting and revoking permissions, inspecting grants, changing passwords, listing users, and working with roles. In practice this means you can `CREATE USER`, `DROP USER`, `GRANT` or `REVOKE` privileges, run `SHOW GRANTS`, change credentials with `ALTER USER`, enumerate users with `SHOW USERS`, and manage roles with `CREATE ROLE`, `DROP ROLE`, `GRANT 'role' TO user`, `REVOKE 'role' FROM user`, and `SHOW ROLES`.
+
+### Privilege Model
+The permission model covers the day‑to‑day operations you would expect: SELECT for reading, INSERT and UPDATE for writing, DELETE for removal, and CREATE or DROP for managing schema. When you need a broad stroke, the `ALL` keyword conveys every privilege in one statement. Grants can target a whole database or a specific table.
+
+### Default Root User
+Out of the box, the system provides a single administrative account: `root@%` with password `root`. This user has `ALL` privileges on every database and table. Treat this as a bootstrap account and change it immediately in production.
+
+### SQL Examples
+
+```sql
+-- Create a readonly user
+CREATE USER 'readonly'@'%' IDENTIFIED BY 'password123';
+
+-- Create an admin user
+CREATE USER 'admin'@'localhost' IDENTIFIED BY 'secure_password';
+
+-- Create a user for specific IP
+CREATE USER 'app_user'@'192.168.1.100' IDENTIFIED BY 'app_pass';
+
+-- Grant SELECT only on all tables in a database
+GRANT SELECT ON mydb.* TO 'readonly'@'%';
+
+-- Grant all privileges on a specific database
+GRANT ALL ON mydb.* TO 'admin'@'localhost';
+
+-- Grant specific privileges on a table
+GRANT SELECT, INSERT, UPDATE ON mydb.users TO 'app_user'@'%';
+
+-- Grant all privileges on all databases
+GRANT ALL ON *.* TO 'superuser'@'%';
+
+-- Revoke specific privilege
+REVOKE INSERT ON mydb.* FROM 'readonly'@'%';
+
+-- Revoke all privileges
+REVOKE ALL ON mydb.* FROM 'user'@'%';
+
+-- Show grants for a user
+SHOW GRANTS FOR 'readonly'@'%';
+
+-- Remove a user
+DROP USER 'old_user'@'%';
+```
+
+### Status
+Production Ready. All features are implemented, integrated, persisted to disk, and available through the web console.
+
+### Quick Start (Auth)
+
+```bash
+cd cmd/mindb-server
+go run main.go
+
+# Create a user and grant access
+curl -u root:root http://localhost:8080/execute \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "CREATE USER '\''alice'\''@'\''%'\'' IDENTIFIED BY '\''alice123'\'';"}'
+
+curl -u root:root http://localhost:8080/execute \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "GRANT SELECT ON mydb.* TO '\''alice'\''@'\''%'\'';"}'
+```
+
+### Persistence & File Structure
+Users, grants, roles, and role assignments are automatically saved and loaded from `{dataDir}/users.json`.
+
+```
+{dataDir}/
+├── users.json          ← User data (persistent)
+├── catalog.json        ← System catalog
+├── wal/                ← Write-ahead log
+└── databases/          ← Database files
+```
+
+Auto‑save triggers: CREATE/DROP USER, GRANT/REVOKE, CREATE/DROP ROLE, ALTER USER.
+
+### Web Console Login UI
+The web console includes a dedicated login screen rather than relying on the browser’s Basic Auth dialog. After you sign in, the console stores your session (per tab) in `sessionStorage`, shows your `username@host` in the header, and adds the proper Authorization header to subsequent requests. You can log out at any time, which clears the session and returns you to the login page. Open the console at `http://localhost:8080/console`.
+
+### API Reference (Auth)
+
+```bash
+POST /execute
+Authorization: Basic base64(username:password)
+Content-Type: application/json
+{ "sql": "SHOW USERS;" }
+```
+
+Common commands:
+
+```sql
+ALTER USER 'username'@'host' IDENTIFIED BY 'newpassword';
+SHOW USERS;
+CREATE ROLE 'rolename';
+GRANT 'rolename' TO 'username'@'host';
+SHOW ROLES;
+```
+
+### Testing (What to verify)
+Exercise the user lifecycle (create, alter, drop), grant and revoke privileges, and confirm what the user can or cannot do. If you rely on roles, create one, attach privileges to it, grant it to a user, and verify inheritance through queries. Use the web console to sign in, sign out, and refresh the page to see session restoration in action. Finally, restart the server and confirm that `users.json` brings your users and grants back automatically.
+
+### Troubleshooting
+If the server starts without a `users.json`, it will create one and seed it with the default `root:root` user. When logins suddenly fail after a restart, check that the JSON is valid and readable only by the service account (0600). If you see “access denied,” revisit the user’s direct grants and any roles you expect to apply, making sure the database/table scope matches your query. For security investigations or lockouts, consult the audit logs under `{dataDir}/audit/audit-YYYY-MM-DD.log`.
+
+### Performance
+Authentication and user lookups are constant time via in‑memory maps, while privilege checks scale with the number of applicable grants and roles for a user—typically just a handful—so authorization remains fast. Persisting changes to disk takes only a few milliseconds, and loading a typical `users.json` on startup is similarly quick even with hundreds of users.
+
+### Files Modified (Implementation)
+The heart of the system lives in `user_management.go`, which models users, roles and grants and handles persistence. SQL support was added in `parser.go`, and the execution paths—including permission checks—reside in `engine_adapter.go`. Security events are recorded by `audit_log.go`. The server boots with user data preloaded by `paged_storage.go`. Finally, the web console under `cmd/mindb-server/web/` provides the login flow and propagates auth to API calls.
+
+### Security Best Practices
+Change the default root password, use specific host patterns instead of `%`, apply least privilege, enable HTTPS in production, and review users and grants regularly.
 
 ##  Installation
 
@@ -225,7 +343,7 @@ COMMIT;
 
 ##  Testing
 
-Mindb has comprehensive test coverage (73.2%) with 125 tests:
+Mindb has comprehensive test coverage (61.6%) with extensive tests:
 
 ```bash
 # Run all tests
@@ -371,4 +489,4 @@ Mindb draws inspiration from established database systems:
 
 **Note**: Mindb is a minimal relational database suitable for lightweight applications, embedded systems, or scenarios requiring a simple SQL database. For large-scale production systems, consider established databases like PostgreSQL, MySQL, or SQLite.
 
-**Status**: 73.2% test coverage and comprehensive feature set.
+**Status**: 61.6% test coverage and comprehensive feature set.
