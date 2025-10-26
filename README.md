@@ -1,36 +1,38 @@
 # Mindb
 
-A minimal relational database written in Go, featuring MVCC transactions, WAL recovery, and comprehensive SQL query support.
+A minimal relational database written in Go with a client-server architecture, featuring MVCC transactions, WAL recovery, and comprehensive SQL query support.
 
 [![Go Version](https://img.shields.io/badge/Go-1.20+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Test Coverage](https://img.shields.io/badge/coverage-61.6%25-green)](https://github.com/sausheong/mindb)
 
-##  Features
+## Features
 
 ### SQL Support
--  **DDL**: CREATE DATABASE, CREATE TABLE, ALTER TABLE, DROP TABLE
--  **DML**: SELECT, INSERT, UPDATE, DELETE
--  **Queries**: WHERE conditions, ORDER BY, LIMIT, OFFSET
--  **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY
--  **Joins**: INNER, LEFT, RIGHT, FULL OUTER, CROSS JOIN
--  **Subqueries**: Scalar, IN, EXISTS (basic support)
--  **Transactions**: BEGIN, COMMIT, ROLLBACK
+- **DDL**: CREATE DATABASE, CREATE TABLE, ALTER TABLE, DROP TABLE
+- **DML**: SELECT, INSERT, UPDATE, DELETE
+- **Queries**: WHERE conditions, ORDER BY, LIMIT, OFFSET
+- **Aggregates**: COUNT, SUM, AVG, MIN, MAX with GROUP BY
+- **Joins**: INNER, LEFT, RIGHT, FULL OUTER, CROSS JOIN
+- **Subqueries**: Scalar, IN, EXISTS (basic support)
+- **Transactions**: BEGIN, COMMIT, ROLLBACK
 
 ### Storage Engine
--  **Paged Storage**: Efficient page-based storage with 4KB pages
--  **Buffer Pool**: LRU cache with configurable size
--  **B-Tree Indexes**: Fast lookups and range queries
--  **MVCC**: Multi-Version Concurrency Control for isolation
--  **WAL**: Write-Ahead Logging with ARIES recovery
--  **Persistence**: Database save/load to disk
+- **Paged Storage**: Efficient page-based storage with 4KB pages
+- **Buffer Pool**: LRU cache with configurable size
+- **B-Tree Indexes**: Fast lookups and range queries
+- **MVCC**: Multi-Version Concurrency Control for isolation
+- **WAL**: Write-Ahead Logging with ARIES recovery
+- **Persistence**: Database save/load to disk
 
 ### Advanced Features
--  **Constraints**: PRIMARY KEY, UNIQUE, NOT NULL, FOREIGN KEY
--  **System Catalog**: Metadata management
--  **Concurrent Access**: Thread-safe operations
--  **Schema Qualification**: Database.table notation
+- **Constraints**: PRIMARY KEY, UNIQUE, NOT NULL, FOREIGN KEY
+- **System Catalog**: Metadata management
+- **Concurrent Access**: Thread-safe operations
+- **Schema Qualification**: Database.table notation
+- **Web Console**: Browser-based SQL interface
+- **REST API**: HTTP endpoints for all operations
 
-##  User Authentication & Access Control
+## User Authentication & Access Control
 
 Mindb ships with a complete, thread‑safe user and permission subsystem. The core data structures model users (with a username, a salted SHA‑256 password hash, and a host constraint) and grants that describe what a user may do against a database or table. A central `UserManager` coordinates creation, lookup, authentication and privilege checks under concurrency.
 
@@ -80,15 +82,18 @@ DROP USER 'old_user'@'%';
 ```
 
 ### Status
-Production Ready. All features are implemented, integrated, persisted to disk, and available through the web console.
+Production Ready. All features are implemented, integrated, persisted to disk, and available through the web console and REST API.
 
 ### Quick Start (Auth)
 
 ```bash
-cd cmd/mindb-server
-go run main.go
+# Start the server
+./mindb
 
-# Create a user and grant access
+# In another terminal, use the CLI client
+./mindb-cli
+
+# Or use curl to create a user
 curl -u root:root http://localhost:8080/execute \
   -H "Content-Type: application/json" \
   -d '{"sql": "CREATE USER '\''alice'\''@'\''%'\'' IDENTIFIED BY '\''alice123'\'';"}'
@@ -112,7 +117,7 @@ Users, grants, roles, and role assignments are automatically saved and loaded fr
 Auto‑save triggers: CREATE/DROP USER, GRANT/REVOKE, CREATE/DROP ROLE, ALTER USER.
 
 ### Web Console Login UI
-The web console includes a dedicated login screen rather than relying on the browser’s Basic Auth dialog. After you sign in, the console stores your session (per tab) in `sessionStorage`, shows your `username@host` in the header, and adds the proper Authorization header to subsequent requests. You can log out at any time, which clears the session and returns you to the login page. Open the console at `http://localhost:8080/console`.
+The web console includes a dedicated login screen rather than relying on the browser's Basic Auth dialog. After you sign in, the console stores your session (per tab) in `sessionStorage`, shows your `username@host` in the header, and adds the proper Authorization header to subsequent requests. You can log out at any time, which clears the session and returns you to the login page. Open the console at `http://localhost:8080/console`.
 
 ### API Reference (Auth)
 
@@ -137,18 +142,18 @@ SHOW ROLES;
 Exercise the user lifecycle (create, alter, drop), grant and revoke privileges, and confirm what the user can or cannot do. If you rely on roles, create one, attach privileges to it, grant it to a user, and verify inheritance through queries. Use the web console to sign in, sign out, and refresh the page to see session restoration in action. Finally, restart the server and confirm that `users.json` brings your users and grants back automatically.
 
 ### Troubleshooting
-If the server starts without a `users.json`, it will create one and seed it with the default `root:root` user. When logins suddenly fail after a restart, check that the JSON is valid and readable only by the service account (0600). If you see “access denied,” revisit the user’s direct grants and any roles you expect to apply, making sure the database/table scope matches your query. For security investigations or lockouts, consult the audit logs under `{dataDir}/audit/audit-YYYY-MM-DD.log`.
+If the server starts without a `users.json`, it will create one and seed it with the default `root:root` user. When logins suddenly fail after a restart, check that the JSON is valid and readable only by the service account (0600). If you see "access denied," revisit the user's direct grants and any roles you expect to apply, making sure the database/table scope matches your query. For security investigations or lockouts, consult the audit logs under `{dataDir}/audit/audit-YYYY-MM-DD.log`.
 
 ### Performance
 Authentication and user lookups are constant time via in‑memory maps, while privilege checks scale with the number of applicable grants and roles for a user—typically just a handful—so authorization remains fast. Persisting changes to disk takes only a few milliseconds, and loading a typical `users.json` on startup is similarly quick even with hundreds of users.
 
 ### Files Modified (Implementation)
-The heart of the system lives in `user_management.go`, which models users, roles and grants and handles persistence. SQL support was added in `parser.go`, and the execution paths—including permission checks—reside in `engine_adapter.go`. Security events are recorded by `audit_log.go`. The server boots with user data preloaded by `paged_storage.go`. Finally, the web console under `cmd/mindb-server/web/` provides the login flow and propagates auth to API calls.
+The heart of the system lives in `user_management.go`, which models users, roles and grants and handles persistence. SQL support was added in `parser.go`, and the execution paths—including permission checks—reside in `engine_adapter.go`. Security events are recorded by `audit_log.go`. The server boots with user data preloaded by `paged_storage.go`. Finally, the web console under `src/server/web/` provides the login flow and propagates auth to API calls.
 
 ### Security Best Practices
 Change the default root password, use specific host patterns instead of `%`, apply least privilege, enable HTTPS in production, and review users and grants regularly.
 
-##  Installation
+## Installation
 
 ```bash
 # Clone the repository
@@ -156,126 +161,68 @@ git clone https://github.com/sausheong/mindb.git
 cd mindb
 
 # Build the project
-go build
+make build
+
+# This creates:
+# bin/mindb     - The server binary
+# bin/mindb-cli - The CLI client
 
 # Run tests
-go test ./...
+make test
 
 # Run with coverage
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out -o coverage.html
+make test && go tool cover -html=coverage_core.out -o coverage.html
 ```
 
-##  Quick Start
+## Quick Start
 
 ### Basic Usage
 
-```go
-package main
+```bash
+# Start the server
+./bin/mindb
 
-import (
-    "fmt"
-    "log"
-)
+# In another terminal, use the CLI client
+./bin/mindb-cli
 
-func main() {
-    // Create engine
-    engine, err := NewPagedEngine("./data")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer engine.Close()
-
-    // Create database
-    engine.CreateDatabase("mydb")
-    engine.UseDatabase("mydb")
-
-    // Create table
-    columns := []Column{
-        {Name: "id", DataType: "INT", PrimaryKey: true},
-        {Name: "name", DataType: "VARCHAR", NotNull: true},
-        {Name: "age", DataType: "INT"},
-    }
-    engine.CreateTable("users", columns)
-
-    // Insert data
-    engine.InsertRow("users", Row{"id": 1, "name": "Alice", "age": 30})
-    engine.InsertRow("users", Row{"id": 2, "name": "Bob", "age": 25})
-
-    // Query data
-    rows, _ := engine.SelectRows("users", []Condition{
-        {Column: "age", Operator: ">", Value: 20},
-    })
-    
-    for _, row := range rows {
-        fmt.Printf("User: %v\n", row)
-    }
-}
+# Or access the web console at http://localhost:8080/console
 ```
 
-### Using the Engine Adapter (Recommended)
+### Server Configuration
 
-```go
-package main
+Create a `.env` file in the same directory as the server:
 
-import (
-    "fmt"
-    "log"
-)
-
-func main() {
-    // Create adapter
-    adapter, err := NewEngineAdapter("./data")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer adapter.Close()
-
-    // Execute SQL
-    adapter.Execute(&Statement{
-        Type:     CreateDatabase,
-        Database: "mydb",
-    })
-    
-    adapter.UseDatabase("mydb")
-
-    // Create table
-    adapter.Execute(&Statement{
-        Type:  CreateTable,
-        Table: "users",
-        Columns: []Column{
-            {Name: "id", DataType: "INT", PrimaryKey: true},
-            {Name: "name", DataType: "VARCHAR"},
-        },
-    })
-
-    // Insert
-    adapter.Execute(&Statement{
-        Type:   Insert,
-        Table:  "users",
-        Values: [][]interface{}{{1, "Alice"}, {2, "Bob"}},
-    })
-
-    // Select
-    result, _ := adapter.Execute(&Statement{
-        Type:  Select,
-        Table: "users",
-    })
-    
-    fmt.Println(result)
-}
+```env
+MINDB_DATA_DIR=./data
+HTTP_ADDR=:8080
+ENABLE_TLS=false
 ```
 
-##  Documentation
+### Using the REST API
 
-### Architecture
+```bash
+# Execute SQL
+curl -X POST http://localhost:8080/execute \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "CREATE DATABASE testdb;"}'
 
-Mindb follows a layered architecture:
+# Query data
+curl -X POST http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT * FROM users;"}'
+```
+
+## Architecture
+
+Mindb follows a layered client-server architecture:
 
 ```
 ┌─────────────────────────────────────┐
-│   Application Layer                 │
-│   (CLI, Engine Adapter)             │
+│   Client Layer                      │
+│   (CLI, Web Console, REST API)      │
+├─────────────────────────────────────┤
+│   Server Layer                      │
+│   (HTTP Server, Auth, Sessions)     │
 ├─────────────────────────────────────┤
 │   Query Processing Layer            │
 │   (Parser, Aggregates, JOINs)       │
@@ -290,6 +237,9 @@ Mindb follows a layered architecture:
 
 ### Key Components
 
+- **Server**: HTTP server with REST API and web console
+- **Core Libraries**: Storage engine, query processing, MVCC
+- **CLI Client**: Command-line interface connecting to server
 - **PagedEngine**: Main storage engine with MVCC support
 - **EngineAdapter**: High-level API for SQL operations
 - **BufferPool**: Memory management with LRU eviction
@@ -320,8 +270,8 @@ INSERT INTO users VALUES (2, 'bob@test.com', 25, 'Sales');
 SELECT * FROM users WHERE age > 25;
 
 -- Aggregates with GROUP BY
-SELECT department, COUNT(*), AVG(age) 
-FROM users 
+SELECT department, COUNT(*), AVG(age)
+FROM users
 GROUP BY department;
 
 -- JOIN operations
@@ -330,8 +280,8 @@ FROM users
 INNER JOIN orders ON users.id = orders.user_id;
 
 -- ORDER BY and LIMIT
-SELECT * FROM users 
-ORDER BY age DESC 
+SELECT * FROM users
+ORDER BY age DESC
 LIMIT 10 OFFSET 5;
 
 -- Transactions
@@ -341,25 +291,24 @@ UPDATE users SET age = 31 WHERE id = 1;
 COMMIT;
 ```
 
-##  Testing
+## Testing
 
-Mindb has comprehensive test coverage (61.6%) with extensive tests:
+Mindb has comprehensive test coverage with extensive tests:
 
 ```bash
 # Run all tests
-go test ./...
+make test
 
 # Run specific test suite
-go test -v -run TestQuery
-go test -v -run TestBufferPool
-go test -v -run TestPersistence
+go test -v -run TestQuery ./src/core/
+go test -v -run TestBufferPool ./src/core/
+go test -v -run TestPersistence ./src/core/
 
-# Run with coverage
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out -o coverage.html
+# Run server tests
+make test-server
 
-# View coverage summary
-go tool cover -func=coverage.out | tail -1
+# View coverage
+make test && go tool cover -html=coverage_core.out -o coverage.html
 ```
 
 ### Test Coverage by Component
@@ -375,35 +324,37 @@ go tool cover -func=coverage.out | tail -1
 | Subqueries | ~71% | Very Good |
 | B-Tree Persistence | ~62% | Good |
 
-##  Project Structure
+## Project Structure
 
 ```
 mindb/
 ├── README.md                      # This file
-├── main.go                        # CLI entry point
-├── engine_adapter.go              # High-level API
-├── paged_storage.go              # Main storage engine
-├── buffer_pool.go                # Memory management
-├── btree.go                      # B-Tree index
-├── btree_persistence.go          # B-Tree save/load
-├── page.go                       # Page management
-├── heapfile.go                   # Heap file storage
-├── wal.go                        # Write-ahead logging
-├── recovery.go                   # ARIES recovery
-├── transaction.go                # Transaction manager
-├── mvcc.go                       # MVCC implementation
-├── catalog.go                    # System catalog
-├── constraints.go                # Constraint validation
-├── parser.go                     # SQL parser
-├── aggregate.go                  # Aggregate functions
-├── join.go                       # JOIN operations
-├── subquery.go                   # Subquery support
-├── persistence.go                # Database persistence
-├── docs/                         # Documentation
-└── *_test.go                     # Test files
+├── Makefile                       # Build automation
+├── go.mod                         # Go module
+├── .gitignore                     # Git ignore rules
+├── src/
+│   ├── core/                      # Core database libraries
+│   │   ├── engine_adapter.go      # High-level API
+│   │   ├── paged_storage.go       # Main storage engine
+│   │   ├── buffer_pool.go         # Memory management
+│   │   ├── btree.go               # B-Tree index
+│   │   ├── parser.go              # SQL parser
+│   │   └── *_test.go              # Test files
+│   ├── server/                    # Server implementation
+│   │   ├── main.go                # Server entry point
+│   │   ├── internal/              # Server internals
+│   │   │   ├── api/               # REST API handlers
+│   │   │   ├── config/            # Configuration
+│   │   │   └── ...
+│   │   ├── web/                   # Web console files
+│   │   ├── Dockerfile             # Container build
+│   │   └── .env.example           # Config example
+│   └── cli/                       # CLI client
+│       └── main.go                # Client entry point
+└── bin/                           # Built binaries (ignored)
 ```
 
-##  Design Goals
+## Design Goals
 
 Mindb is designed as a minimal relational database that:
 
@@ -413,28 +364,44 @@ Mindb is designed as a minimal relational database that:
 - Offers production-ready code quality with comprehensive testing
 - Balances features with simplicity
 - Demonstrates practical database implementation patterns
+- Runs as a client-server system with REST API and web console
 
-##  Configuration
+## Configuration
+
+### Server Configuration
+
+The server reads configuration from environment variables or a `.env` file:
+
+```env
+# Data directory
+MINDB_DATA_DIR=./data
+
+# Server address
+HTTP_ADDR=:8080
+
+# TLS settings
+ENABLE_TLS=false
+TLS_CERT_FILE=./certs/server.crt
+TLS_KEY_FILE=./certs/server.key
+
+# Performance settings
+READ_TIMEOUT=30s
+WRITE_TIMEOUT=30s
+MAX_CONNECTIONS=100
+
+# Authentication
+AUTH_DISABLED=false
+```
 
 ### Buffer Pool Size
 
-```go
-// Create engine with custom buffer pool size
-engine, _ := NewPagedEngine("./data")
-// Default buffer pool size is 128 pages (512KB)
-
-// Or configure manually
-pool := NewBufferPool(256) // 256 pages (1MB)
-```
+The buffer pool size can be configured through the storage engine (default: 128 pages = 512KB).
 
 ### WAL Configuration
 
-```go
-// Enable WAL for durability
-engine, _ := NewPagedEngineWithWAL("./data", true)
-```
+WAL is always enabled for data durability and crash recovery.
 
-##  Performance
+## Performance
 
 Mindb balances simplicity with performance through:
 
@@ -443,15 +410,16 @@ Mindb balances simplicity with performance through:
 - **MVCC**: Non-blocking reads for high concurrency
 - **WAL**: Sequential writes for durability
 - **Efficient Storage**: Page-based storage with 4KB pages
+- **HTTP/2 Support**: Efficient client-server communication
 
 ### Benchmarks
 
 ```bash
 # Run benchmarks
-go test -bench=. -benchmem
+go test -bench=. -benchmem ./src/core/
 ```
 
-##  Contributing
+## Contributing
 
 Contributions are welcome! Areas for improvement:
 
@@ -463,9 +431,9 @@ Contributions are welcome! Areas for improvement:
 - [ ] Cost-based optimization
 - [ ] More index types (Hash, GiST)
 - [ ] Parallel query execution
+- [ ] Additional client libraries (Python, JavaScript, etc.)
 
-
-##  Acknowledgments
+## Acknowledgments
 
 Mindb draws inspiration from established database systems:
 
@@ -474,19 +442,18 @@ Mindb draws inspiration from established database systems:
 - Modern database research and best practices
 - Various open-source database projects
 
-##  Contact
+## Contact
 
 - **Author**: Chang Sau Sheong
 - **GitHub**: [@sausheong](https://github.com/sausheong)
 
-##  Resources
+## Resources
 
-- [Architecture Documentation](docs/architecture.md)
-- [Test Coverage Report](docs/COVERAGE_REPORT.md)
-- [Implementation Notes](docs/COMPLETE_FINAL_SUMMARY.md)
+- [OpenAPI Specification](src/server/openapi.yaml)
+- [Web Console](http://localhost:8080/console) (when server is running)
 
 ---
 
 **Note**: Mindb is a minimal relational database suitable for lightweight applications, embedded systems, or scenarios requiring a simple SQL database. For large-scale production systems, consider established databases like PostgreSQL, MySQL, or SQLite.
 
-**Status**: 61.6% test coverage and comprehensive feature set.
+**Status**: 61.6% test coverage and comprehensive feature set with client-server architecture.
